@@ -22,6 +22,7 @@ Two arms expose an identical OpenAI `/v1` endpoint. The same official `bfcl` CLI
 | `launch_arm.sh` | bring up one arm (`a` = pure vLLM, `b` = vLLM-gRPC + SMG); prints its base_url; `stop` tears down via pidfiles. Fully env-parameterised. |
 | `run_ab.py` | point official `bfcl generate`+`evaluate` (FC mode) at both arms, parse per-category accuracy + test-case count, emit a markdown + JSON comparison table (with both **unweighted** = mean-of-categories and **weighted-by-n** = micro overall, matching BFCL's `calculate_unweighted/weighted_accuracy`), and a regression gate. Arms must already be serving. |
 | `register_bfcl_model.py` | register a model that bfcl-eval doesn't ship a handler for yet (new SKUs), by cloning an existing FC entry. Idempotent. |
+| `run_repeats.sh` | run one leg as several independent A/B pairs side by side on one node (each with its own GPUs, ports and project root), score them concurrently, then `run_ab.py --combine` their reports: each category averaged over the runs, each run listed, the gate applied to the mean. |
 
 ## Quick start (manual, e.g. on a GPU box)
 
@@ -89,6 +90,15 @@ a GitHub Actions matrix — one leg per model, `fail-fast: false`, each on its o
   scheduled run skips these legs while the `blackwell` runner is offline (it has
   served no job since 2026-09-18); a `workflow_dispatch`, with or without `only`,
   still runs them.
+- `8-gpu-mi325x` (AMD Instinct MI325X; label overridable with the repo variable
+  `SMG_RUNNER_AMD_GPU_8`) — `gpt-oss-amd` and `qwen3.8-amd`: the H100 legs'
+  models and parsers, TP=1 per arm, four runs per leg (see `repeated` below). vLLM
+  is the ROCm wheel of the same CI pin (`scripts/ci_install_vllm_rocm.sh`), so an
+  AMD leg and its H100 counterpart differ only in hardware; the runner needs ROCm
+  7.2 installed, the release that wheel is built for. These legs need an
+  AMD-provided self-hosted runner; until one is registered and the repo variable
+  `SMG_RUN_AMD_LEGS` is `true`, they run only from a `workflow_dispatch` that
+  names them with `only`. They never run on `pull_request`.
 
 All legs use `max_model_len` **32768**: the `multi_turn` categories emit ~18k-token
 prompts that 400'd ("decoder prompt longer than the maximum model length") at 16384.
@@ -103,6 +113,14 @@ Each leg sets `arm_mode`:
   so the arms can't coexist: `run_ab.py --score-arm` scores arm A alone → tears it
   down → scores arm B alone → `--diff-baseline/--diff-candidate` compares the two
   saved score files. Flip a leg's `arm_mode` to enable it.
+- **repeated** (the AMD legs) — when an arm needs only `tp` GPUs, one node holds
+  `repeats` independent A/B pairs (run *i* on GPUs `2i·tp …`); `run_repeats.sh`
+  scores them concurrently and gates on their mean. BFCL runs sample (vLLM raises
+  BFCL's temperature of 0.001 to 0.01), and in two identical runs of Qwen3-0.6B the
+  same arm changed its verdict on 2–13% of the cases per category and the
+  unweighted Δ moved by up to 1.45 points, close to the 2-point tolerance;
+  averaging four runs halves that noise for the cost of GPUs that would otherwise
+  sit idle, not wall-clock time.
 
 Per the A/B's premise, model size is irrelevant — a smaller same-family checkpoint
 exercises the identical parser — so the matrix uses DeepSeek-V4.1-Flash to validate
@@ -111,8 +129,8 @@ former Kimi-K2.6 leg exercised the K2 parser, not the K3 one SMG now ships, and 
 published Kimi-K3 checkpoint is about 1.5 TB, which does not fit a single 8-GPU node.
 
 `workflow_dispatch` can target one leg via the `only` input and override
-`model`/`bfcl_model`/parsers per run. PRs touching this pipeline run **all** legs
-(H100 + Blackwell) as an end-to-end sanity check, but cheaply — the PR category set
+`model`/`bfcl_model`/parsers per run. PRs touching this pipeline run the H100 and
+Blackwell legs as an end-to-end sanity check, but cheaply — the PR category set
 is a tiny non-live subset (`simple_python,irrelevance`) for every leg.
 
 A leg whose model the pinned vLLM release (`scripts/ci_install_vllm.sh`) cannot serve

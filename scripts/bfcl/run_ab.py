@@ -28,6 +28,14 @@ launch them. Example::
         --project-root /home/keyang/bfcl_ab \\
         --out /tmp/bfcl_ab.md --json-out /tmp/bfcl_ab.json
 
+Repeated runs of one leg (several A/B pairs side by side on one node, see
+``run_repeats.sh``) each write a ``--json-out`` report; ``--combine`` averages
+every category over the runs, lists each run's overall result, and gates on the
+mean::
+
+    python run_ab.py --combine run0/bfcl_ab.json run1/bfcl_ab.json \\
+        --categories simple_python,irrelevance --out /tmp/bfcl_ab.md
+
 Exit codes: ``0`` clean, ``1`` score regression beyond ``--tolerance``, ``2`` an
 arm did not finish (timed out or scored nothing), so there is nothing to compare.
 """
@@ -366,11 +374,116 @@ def load_scores(path: Path) -> Arm:
     )
 
 
+def load_runs(paths: list[Path], categories: list[str]) -> tuple[Arm, Arm, list[dict]]:
+    """Average repeated runs of one leg, given their ``--json-out`` reports.
+
+    Each arm's accuracy in a category becomes the mean over the runs that scored
+    it, so the unweighted and weighted overalls are the means of the runs'
+    overalls. Runs without a report are kept in the list so the caller can
+    treat the combined result as incomplete.
+    """
+    runs: list[dict] = []
+    reports: list[dict] = []
+    for path in paths:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            runs.append({"report": str(path), "error": "no report"})
+            continue
+        reports.append(data)
+        runs.append(
+            {
+                "report": str(path),
+                "overall": data.get("overall", {}),
+                "overall_weighted": data.get("overall_weighted", {}),
+                "incomplete": data.get("incomplete", {}),
+            }
+        )
+
+    def mean_arm(side: str) -> Arm:
+        arms = [report[side] for report in reports]
+        scores: dict[str, float] = {}
+        counts: dict[str, int] = {}
+        for cat in categories:
+            vals = [a["scores"][cat] for a in arms if a.get("scores", {}).get(cat) is not None]
+            if vals:
+                scores[cat] = sum(vals) / len(vals)
+            n = next((a["counts"][cat] for a in arms if a.get("counts", {}).get(cat)), None)
+            if n:
+                counts[cat] = n
+        return Arm(
+            name=arms[0]["name"] if arms else side, base_url="", scores=scores, counts=counts
+        )
+
+    return mean_arm("baseline"), mean_arm("candidate"), runs
+
+
+def add_runs(
+    report_md: str, payload: dict, runs: list[dict], baseline: str, candidate: str
+) -> tuple[str, dict]:
+    """Mark the table as a mean over runs, list each run, and record incomplete runs."""
+
+    def cell(overall: dict) -> str:
+        if not overall or overall.get("delta") is None:
+            return "—"
+        return (
+            f"{overall['baseline'] * 100:.2f} / {overall['candidate'] * 100:.2f} "
+            f"({overall['delta'] * 100:+.2f})"
+        )
+
+    def spread(key: str) -> str:
+        deltas = [r[key]["delta"] for r in runs if r.get(key, {}).get("delta") is not None]
+        if not deltas:
+            return "—"
+        return f"{min(deltas) * 100:+.2f} to {max(deltas) * 100:+.2f}"
+
+    incomplete_runs: dict[str, str] = {}
+    for i, run in enumerate(runs, 1):
+        if "error" in run:
+            incomplete_runs[str(i)] = run["error"]
+        elif run["incomplete"]:
+            incomplete_runs[str(i)] = "; ".join(
+                f"arm {name}: {reason}" for name, reason in run["incomplete"].items()
+            )
+
+    lines = report_md.split("\n")
+    lines[1:1] = [
+        "",
+        f"> Mean of {len(runs)} runs of this leg: each category is averaged over the runs, "
+        "and the regression gate applies to the mean unweighted Δ. Each run is listed "
+        "below the table.",
+    ]
+    lines += [
+        "",
+        f"**Each run** (overall, {baseline} / {candidate} (Δ)):",
+        "",
+        "| run | unweighted | weighted by n |",
+        "|---|---|---|",
+    ]
+    for i, run in enumerate(runs, 1):
+        if "error" in run:
+            lines.append(f"| {i} | {run['error']} | {run['error']} |")
+        else:
+            lines.append(f"| {i} | {cell(run['overall'])} | {cell(run['overall_weighted'])} |")
+    lines.append(f"| range of Δ | {spread('overall')} | {spread('overall_weighted')} |")
+    for i, reason in incomplete_runs.items():
+        lines += ["", f"> ⚠️ **Incomplete run {i}** — {reason}."]
+    payload["runs"] = runs
+    payload["incomplete_runs"] = incomplete_runs
+    return "\n".join(lines), payload
+
+
 def write_report_and_gate(
-    baseline: Arm, candidate: Arm, categories: list[str], args: argparse.Namespace
+    baseline: Arm,
+    candidate: Arm,
+    categories: list[str],
+    args: argparse.Namespace,
+    runs: list[dict] | None = None,
 ) -> int:
     """Emit the markdown + JSON comparison and apply the completeness/regression gates."""
     report_md, payload = build_report(baseline, candidate, categories)
+    if runs is not None:
+        report_md, payload = add_runs(report_md, payload, runs, baseline.name, candidate.name)
     print("\n" + report_md)
     if args.out:
         args.out.write_text(report_md + "\n", encoding="utf-8")
@@ -390,7 +503,10 @@ def write_report_and_gate(
     # An incomplete arm outranks a regression: there is no trustworthy delta to gate on.
     for name, reason in payload["incomplete"].items():
         print(f"\nINCOMPLETE: arm {name} — {reason}", file=sys.stderr)
-    if payload["incomplete"] and not args.allow_incomplete:
+    for run, reason in payload.get("incomplete_runs", {}).items():
+        print(f"\nINCOMPLETE: run {run} — {reason}", file=sys.stderr)
+    incomplete = payload["incomplete"] or payload.get("incomplete_runs")
+    if incomplete and not args.allow_incomplete:
         exit_code = EXIT_INCOMPLETE
     return exit_code
 
@@ -408,6 +524,15 @@ def main() -> int:
     p.add_argument("--scores-out", type=Path, help="write this arm's scores JSON here")
     p.add_argument("--diff-baseline", type=Path, help="baseline scores JSON (from --scores-out)")
     p.add_argument("--diff-candidate", type=Path, help="candidate scores JSON (from --scores-out)")
+    # Repeated runs (several A/B pairs of one leg side by side): average their
+    # --json-out reports and gate once, on the mean.
+    p.add_argument(
+        "--combine",
+        type=Path,
+        nargs="+",
+        metavar="REPORT",
+        help="--json-out reports of repeated runs of one leg to average and gate on",
+    )
     p.add_argument(
         "--bfcl-model",
         help="BFCL model handler name, e.g. Qwen/Qwen3-4B-Instruct-2507-FC",
@@ -446,6 +571,11 @@ def main() -> int:
     args = p.parse_args()
 
     categories = [c.strip() for c in args.categories.split(",") if c.strip()]
+
+    # Mode: average repeated runs of one leg (run_repeats.sh, final step).
+    if args.combine:
+        baseline, candidate, runs = load_runs(args.combine, categories)
+        return write_report_and_gate(baseline, candidate, categories, args, runs=runs)
 
     # Mode: diff two previously-saved score files (sequential mode, final step).
     if args.diff_baseline or args.diff_candidate:
