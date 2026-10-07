@@ -22,7 +22,6 @@ Two arms expose an identical OpenAI `/v1` endpoint. The same official `bfcl` CLI
 | `launch_arm.sh` | bring up one arm (`a` = pure vLLM, `b` = vLLM-gRPC + SMG); prints its base_url; `stop` tears down via pidfiles. Fully env-parameterised. |
 | `run_ab.py` | point official `bfcl generate`+`evaluate` (FC mode) at both arms, parse per-category accuracy + test-case count, emit a markdown + JSON comparison table (with both **unweighted** = mean-of-categories and **weighted-by-n** = micro overall, matching BFCL's `calculate_unweighted/weighted_accuracy`), and a regression gate. Arms must already be serving. |
 | `register_bfcl_model.py` | register a model that bfcl-eval doesn't ship a handler for yet (new SKUs), by cloning an existing FC entry. Idempotent. |
-| `run_repeats.sh` | run one leg as several independent A/B pairs side by side on one node (each with its own GPUs, ports and project root), score them concurrently, then `run_ab.py --combine` their reports: each category averaged over the runs, each run listed, the gate applied to the mean. |
 
 ## Quick start (manual, e.g. on a GPU box)
 
@@ -92,7 +91,7 @@ a GitHub Actions matrix — one leg per model, `fail-fast: false`, each on its o
   still runs them.
 - `8-gpu-mi325x` (AMD Instinct MI325X; label overridable with the repo variable
   `SMG_RUNNER_AMD_GPU_8`) — `gpt-oss-amd` and `qwen3.8-amd`: the H100 legs'
-  models and parsers, TP=1 per arm, four runs per leg (see `repeated` below). vLLM
+  models and parsers, TP=1 per arm, both arms concurrent on GPUs 0 and 1. vLLM
   is the ROCm wheel of the same CI pin (`scripts/ci_install_vllm_rocm.sh`), so an
   AMD leg and its H100 counterpart differ only in hardware; the runner needs ROCm
   7.2 installed, the release that wheel is built for. These legs need an
@@ -113,14 +112,6 @@ Each leg sets `arm_mode`:
   so the arms can't coexist: `run_ab.py --score-arm` scores arm A alone → tears it
   down → scores arm B alone → `--diff-baseline/--diff-candidate` compares the two
   saved score files. Flip a leg's `arm_mode` to enable it.
-- **repeated** (the AMD legs) — when an arm needs only `tp` GPUs, one node holds
-  `repeats` independent A/B pairs (run *i* on GPUs `2i·tp …`); `run_repeats.sh`
-  scores them concurrently and gates on their mean. BFCL runs sample (vLLM raises
-  BFCL's temperature of 0.001 to 0.01), and in two identical runs of Qwen3-0.6B the
-  same arm changed its verdict on 2–13% of the cases per category and the
-  unweighted Δ moved by up to 1.45 points, close to the 2-point tolerance;
-  averaging four runs halves that noise for the cost of GPUs that would otherwise
-  sit idle, not wall-clock time.
 
 Per the A/B's premise, model size is irrelevant — a smaller same-family checkpoint
 exercises the identical parser — so the matrix uses DeepSeek-V4.1-Flash to validate

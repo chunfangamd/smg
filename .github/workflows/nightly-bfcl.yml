@@ -242,28 +242,24 @@ jobs:
                "run_timeout": "7200",
                "model_cache": "/raid/models", "arm_mode": "concurrent", "max_model_len": "auto"},
               # AMD legs (MI325X, 256 GB per GPU): the H100 legs' models and parsers,
-              # with each arm on one GPU (TP=1), so one 8-GPU node holds `repeats`
-              # independent A/B pairs side by side (GPUs 0,1 / 2,3 / 4,5 / 6,7). They
-              # are scored concurrently and gated on their mean
-              # (scripts/bfcl/run_repeats.sh), which narrows the run-to-run noise
-              # without adding wall-clock time. vLLM is the ROCm wheel of the same CI
-              # pin (scripts/ci_install_vllm_rocm.sh).
+              # each arm on one GPU (TP=1), both arms concurrent (GPU 0 + GPU 1). vLLM
+              # is the ROCm wheel of the same CI pin (scripts/ci_install_vllm_rocm.sh).
               {"name": "gpt-oss-amd", "runner": amd_runner, "vendor": "amd", "tp": 1,
-               "repeats": 4,
+               "gpu_a": "0", "gpu_b": "1",
                "model": "openai/gpt-oss-120b", "bfcl_model": "openai/gpt-oss-120b-FC",
                "vllm_tool": "openai", "vllm_reason": "",
                "smg_tool": "", "smg_reason": "",
                "vllm_extra": "", "gpu_mem": "0.85", "startup_timeout": "900",
                "run_timeout": "7200",
-               "model_cache": "/models", "arm_mode": "repeated", "max_model_len": "auto"},
+               "model_cache": "/models", "arm_mode": "concurrent", "max_model_len": "auto"},
               {"name": "qwen3.8-amd", "runner": amd_runner, "vendor": "amd", "tp": 1,
-               "repeats": 4,
+               "gpu_a": "0", "gpu_b": "1",
                "model": "Qwen/Qwen3.8-27B", "bfcl_model": "Qwen/Qwen3.8-27B-FC",
                "vllm_tool": "qwen3_xml", "vllm_reason": "qwen3",
                "smg_tool": "qwen_xml", "smg_reason": "qwen3",
                "vllm_extra": "", "gpu_mem": "0.85", "startup_timeout": "900",
                "run_timeout": "18000",
-               "model_cache": "/models", "arm_mode": "repeated", "max_model_len": "auto"},
+               "model_cache": "/models", "arm_mode": "concurrent", "max_model_len": "auto"},
           ]
           only = os.environ.get("ONLY", "")
           valid_names = [l["name"] for l in legs]
@@ -386,7 +382,6 @@ jobs:
           ARM_MODE: ${{ matrix.arm_mode }}
           GPU_A: ${{ matrix.gpu_a }}
           GPU_B: ${{ matrix.gpu_b }}
-          REPEATS: ${{ matrix.repeats }}
           GPU_VENDOR: ${{ matrix.vendor || 'nvidia' }}
           # Per-leg health-wait budget: big MoEs need minutes for load + compile + quant.
           BFCL_STARTUP_TIMEOUT: ${{ matrix.startup_timeout }}
@@ -469,12 +464,6 @@ jobs:
               --categories "$CATEGORIES" \
               --out "$RUNNER_TEMP/bfcl_ab.md" --json-out "$RUNNER_TEMP/bfcl_ab.json" \
               --tolerance 0.02
-          elif [ "$ARM_MODE" = repeated ]; then
-            # One node, $REPEATS independent A/B pairs side by side (each arm on
-            # $BFCL_TP GPUs), scored concurrently and gated on their mean.
-            export AB_ROOT="$ROOT" BFCL
-            gate bash scripts/bfcl/run_repeats.sh "$REPEATS" \
-              "$RUNNER_TEMP/bfcl_ab.md" "$RUNNER_TEMP/bfcl_ab.json" 9>&-
           else
             # Concurrent: arm A (pure vLLM) on the first GPU half, arm B (SMG ->
             # vLLM gRPC) on the second; ports left unset so launch_arm.sh picks free.
@@ -535,8 +524,6 @@ jobs:
             ${{ runner.temp }}/bfcl_ab.md
             ${{ runner.temp }}/bfcl_ab.json
             ${{ runner.temp }}/bfcl_ab/*/score/**
-            ${{ runner.temp }}/bfcl_ab/run*/bfcl_ab.*
-            ${{ runner.temp }}/bfcl_ab/run*/*/score/**
             ${{ runner.temp }}/bfcl_transcripts.tgz
           if-no-files-found: warn
           retention-days: 30
@@ -546,9 +533,7 @@ jobs:
         with:
           name: bfcl-ab-${{ matrix.name }}-logs-${{ github.run_id }}
           # vLLM/SMG logs — only useful on crash/timeout; noise on success.
-          path: |
-            ${{ runner.temp }}/bfcl_run/*.log
-            ${{ runner.temp }}/bfcl_run/run*/*.log
+          path: ${{ runner.temp }}/bfcl_run/*.log
           if-no-files-found: ignore
           retention-days: 14
       - name: Teardown arms (leg-scoped backstop)
@@ -558,9 +543,4 @@ jobs:
         # agents, so killing by GPU occupancy would take down their jobs too.
         env:
           BFCL_RUN_DIR: ${{ runner.temp }}/bfcl_run
-        run: |
-          bash scripts/bfcl/launch_arm.sh stop || true
-          # Repeated legs keep each run's pidfiles in its own subdirectory.
-          for dir in "$BFCL_RUN_DIR"/run*/; do
-            [ -d "$dir" ] && BFCL_RUN_DIR="$dir" bash scripts/bfcl/launch_arm.sh stop || true
-          done
+        run: bash scripts/bfcl/launch_arm.sh stop || true
