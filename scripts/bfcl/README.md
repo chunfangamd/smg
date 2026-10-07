@@ -97,7 +97,8 @@ a GitHub Actions matrix — one leg per model, `fail-fast: false`, each on its o
   7.2 installed, the release that wheel is built for. These legs need an
   AMD-provided self-hosted runner; until one is registered and the repo variable
   `SMG_RUN_AMD_LEGS` is `true`, they run only from a `workflow_dispatch` that
-  names them with `only`. They never run on `pull_request`.
+  asks for them, with `only` or with `hardware: amd`. They never run on
+  `pull_request`.
 
 All legs use `max_model_len` **32768**: the `multi_turn` categories emit ~18k-token
 prompts that 400'd ("decoder prompt longer than the maximum model length") at 16384.
@@ -119,7 +120,8 @@ the `deepseek_v41` parser without the full V4.1 weights. There is no Kimi leg: t
 former Kimi-K2.6 leg exercised the K2 parser, not the K3 one SMG now ships, and every
 published Kimi-K3 checkpoint is about 1.5 TB, which does not fit a single 8-GPU node.
 
-`workflow_dispatch` can target one leg via the `only` input and override
+`workflow_dispatch` can target one leg via the `only` input, or one vendor's legs
+via `hardware` (`both`, the default, `nvidia` or `amd`), and override
 `model`/`bfcl_model`/parsers per run. PRs touching this pipeline run the H100 and
 Blackwell legs as an end-to-end sanity check, but cheaply — the PR category set
 is a tiny non-live subset (`simple_python,irrelevance`) for every leg.

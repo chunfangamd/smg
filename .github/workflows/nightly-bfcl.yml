@@ -13,7 +13,7 @@
 # (see scripts/bfcl/README.md "Validation status").
 # AMD legs run the H100 legs' models on an AMD Instinct self-hosted runner; until
 # one is registered and the repo variable SMG_RUN_AMD_LEGS is "true", only a
-# dispatch that names them with `only` runs them.
+# dispatch that asks for them (`only`, or `hardware: amd`) runs them.
 name: Nightly BFCL
 
 on:
@@ -32,6 +32,15 @@ on:
         description: "Run only this matrix leg (qwen3.8|gpt-oss|deepseek-v4.1|minimax-m3|glm-5.3-flash|gpt-oss-amd|qwen3.8-amd); empty = all"
         required: false
         default: ""
+      hardware:
+        description: "Run only the legs on this hardware; both = NVIDIA and AMD"
+        required: false
+        type: choice
+        options:
+          - both
+          - nvidia
+          - amd
+        default: both
       model:
         description: "Override HF model id (weights) for the selected leg; empty = matrix default. Override model and bfcl_model together — mismatched weights/handler pair if only one is overridden."
         required: false
@@ -120,6 +129,7 @@ jobs:
       - id: build
         env:
           ONLY: ${{ github.event.inputs.only }}
+          HARDWARE: ${{ github.event.inputs.hardware }}
           EVENT_NAME: ${{ github.event_name }}
           MODEL_OVERRIDE: ${{ github.event.inputs.model }}
           BFCL_OVERRIDE: ${{ github.event.inputs.bfcl_model }}
@@ -262,6 +272,7 @@ jobs:
                "model_cache": "/models", "arm_mode": "concurrent", "max_model_len": "auto"},
           ]
           only = os.environ.get("ONLY", "")
+          hardware = os.environ.get("HARDWARE") or "both"
           valid_names = [l["name"] for l in legs]
           if only:
               legs = [l for l in legs if l["name"] == only]
@@ -269,6 +280,11 @@ jobs:
           # below are a tiny non-live subset for every leg.
           if only and not legs:
               raise SystemExit(f"unknown leg {only!r}; valid: {valid_names}")
+          # A leg without "vendor" runs on NVIDIA.
+          if hardware != "both":
+              legs = [l for l in legs if l.get("vendor", "nvidia") == hardware]
+              if not legs:
+                  raise SystemExit(f"leg {only!r} does not run on {hardware}")
           # Scheduled runs take the H100 legs only: the `blackwell` runner has served
           # no job since 2026-09-18, and a leg queued against an offline label sits in
           # GitHub's queue for its 24h maximum and is cancelled, which marks the whole
@@ -278,10 +294,12 @@ jobs:
           if os.environ.get("EVENT_NAME") == "schedule":
               legs = [l for l in legs if l["runner"] != "blackwell"]
           # The AMD legs need AMD's runner. Until it is online (SMG_RUN_AMD_LEGS
-          # = "true") they run only when `only` names them, for the same 24h-queue
-          # reason, and never on pull_request: that runner takes code from main only.
+          # = "true") they run only when a dispatch asks for them (`only`, or
+          # `hardware: amd`), for the same 24h-queue reason, and never on
+          # pull_request: that runner takes code from main only.
+          amd_requested = bool(only) or hardware == "amd"
           if os.environ.get("EVENT_NAME") == "pull_request" or (
-              os.environ.get("AMD_ENABLED") != "true" and not only
+              os.environ.get("AMD_ENABLED") != "true" and not amd_requested
           ):
               legs = [l for l in legs if l.get("vendor") != "amd"]
           print("matrix=" + json.dumps({"include": legs}))
