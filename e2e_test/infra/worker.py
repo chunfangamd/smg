@@ -34,6 +34,7 @@ from .constants import (
     get_vllm_mm_processor,
     get_vllm_servicer_impl,
     get_zmq_engine_count,
+    host_port,
     moriio_host,
     sglang_transfer_backend,
     vllm_kv_backend,
@@ -46,6 +47,7 @@ from .process_utils import (
     detect_rdma_fabric_devices,
     get_open_port,
     get_open_port_block,
+    gpu_compute_apps,
     gpu_memory_used_mib,
     reserve_port,
     wait_for_gpu_memory_release,
@@ -105,8 +107,8 @@ class Worker:
 
             return _zmq_ipc_url(self.port)
         if self.mode == ConnectionMode.GRPC:
-            return f"grpc://{DEFAULT_HOST}:{self.port}"
-        return f"http://{DEFAULT_HOST}:{self.port}"
+            return f"grpc://{host_port(DEFAULT_HOST, self.port)}"
+        return f"http://{host_port(DEFAULT_HOST, self.port)}"
 
     @property
     def worker_url(self) -> str:
@@ -116,7 +118,7 @@ class Worker:
     @property
     def http_url(self) -> str:
         """HTTP URL (used for health checks even on gRPC workers)."""
-        return f"http://{DEFAULT_HOST}:{self.port}"
+        return f"http://{host_port(DEFAULT_HOST, self.port)}"
 
     def start(
         self,
@@ -246,13 +248,18 @@ class Worker:
             held = wait_for_gpu_memory_release(self.gpu_ids, self._gpu_mem_baseline, timeout=30.0)
             if held:
                 # The wait gives up once the figure stops moving, usually well
-                # inside the 30 s cap; report what was actually waited.
+                # inside the 30 s cap; report what was actually waited, and
+                # the compute processes nvidia-smi lists on those GPUs. An empty
+                # list is not evidence of anything from inside a container (see
+                # gpu_compute_apps).
                 logger.warning(
-                    "Worker %s: GPU memory still held %.0fs after stop: used %s MiB, baseline %s MiB",
+                    "Worker %s: GPU memory still held %.0fs after stop: used %s MiB, "
+                    "baseline %s MiB, compute processes nvidia-smi lists there: %s",
                     self.model_id,
                     time.monotonic() - waited,
                     held,
                     self._gpu_mem_baseline,
+                    gpu_compute_apps(sorted(held)),
                 )
 
         # Clean up log file
@@ -449,7 +456,20 @@ class Worker:
                     "kv_connector_extra_config": self._moriio_extra_config(tp_size),
                 }
             else:
-                config = {"kv_connector": "NixlConnector", "kv_role": kv_role}
+                config = {
+                    "kv_connector": "NixlConnector",
+                    "kv_role": kv_role,
+                    # A decode keeps a dead prefill's KV region mapped until it
+                    # forgets that peer, and the connector forgets idle peers
+                    # only after engine_ttl seconds (an hour by default). A
+                    # prefill restarted on the same GPU inside that window
+                    # fails its startup free-memory check: on 0.29.0, 53 GiB
+                    # of the dead worker stayed resident with the UCX IPC
+                    # cache already off (see _build_env). Forget idle peers
+                    # after a few seconds instead; the next request to one
+                    # re-runs the handshake, which is cheap at this scale.
+                    "kv_connector_extra_config": {"engine_ttl": 3},
+                }
             cmd.extend(["--kv-transfer-config", json.dumps(config)])
 
         extra = spec.get("vllm_args", [])
@@ -648,6 +668,19 @@ class Worker:
         env = os.environ.copy()
         env.setdefault("PYTHONUNBUFFERED", "1")
         env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, self.gpu_ids))
+        if self.engine == "vllm":
+            # vLLM 0.31.0 runs tensor-parallel all-reduces through FlashInfer,
+            # whose auto backend picks the MNNVL kernel wherever NVLink
+            # multicast exists, H100 included. FlashInfer 0.7.0 ships its
+            # jit-cache as per-architecture wheels, and the Hopper wheel does
+            # not carry that kernel (its AOT list builds it for sm100/sm103
+            # only, where the 0.6.x single wheel carried it for every arch),
+            # so the worker JIT-compiles it with nvcc, which the pods do not
+            # have, and dies at the first all-reduce of the startup memory
+            # profile. The TRT-LLM backend is the same fused all-reduce
+            # integration and is prebuilt for Hopper. An explicit choice wins.
+            env.setdefault("VLLM_FLASHINFER_ALLREDUCE_BACKEND", "trtllm")
+
         # The vLLM gRPC servicer implementation is a flag inside the smg
         # servicer package, read by upstream's entrypoint; the command stays.
         if self.engine == "vllm" and self.mode == ConnectionMode.GRPC:
@@ -741,6 +774,8 @@ class Worker:
                 # allocated 60 s after every prefill process had exited), and
                 # the prefill restarted on that GPU fails its free-memory
                 # check. Drop the cache so a mapping ends with its transfer.
+                # From vLLM 0.29.0 the reader keeps a mapping per peer anyway,
+                # so the engine_ttl in _build_vllm_base_cmd carries the rest.
                 env.setdefault("UCX_CUDA_IPC_CACHE", "n")
 
         if self.engine == "trtllm":
@@ -816,7 +851,7 @@ class Worker:
             )
 
         start = time.perf_counter()
-        channel = grpc.insecure_channel(f"{DEFAULT_HOST}:{self.port}")
+        channel = grpc.insecure_channel(host_port(DEFAULT_HOST, self.port))
         try:
             while time.perf_counter() - start < timeout:
                 if not self.is_alive():
@@ -886,10 +921,10 @@ def start_workers(
         mode: Connection mode (HTTP or GRPC).
         count: Number of workers to start.
         worker_type: Worker specialization (regular, prefill, decode).
-        timeout: Seconds to wait for each worker to become healthy.
+        timeout: Shared startup bound for all workers to become healthy.
         log_dir: Directory to store worker log files.
         gpu_offset: Starting GPU index for worker assignment.
-        wait_ready: If True (default), block until each worker is healthy.
+        wait_ready: If True (default), spawn all workers before waiting for health.
             If False, spawn processes and return immediately.
         gpus: GPUs per worker; defaults to the model spec's tp (e.g. DP needs dp*tp).
         extra_engine_args: Extra CLI args appended to the engine launch command.
@@ -946,7 +981,7 @@ def start_workers(
                 WorkerType.DECODE,
             )
             dist_init_port = get_open_port() if is_ts_disagg else None
-            dist_init_addr = f"{DEFAULT_HOST}:{dist_init_port}" if dist_init_port else None
+            dist_init_addr = host_port(DEFAULT_HOST, dist_init_port) if dist_init_port else None
 
             worker = Worker(
                 model_id=model_id,
@@ -972,7 +1007,19 @@ def start_workers(
                 time.sleep(LAUNCH_STAGGER_DELAY)
 
             workers.append(worker)
-            worker.start(timeout=timeout, wait_ready=wait_ready)
+            # Each worker has its own GPU slice. Let model loading overlap
+            # instead of holding later workers' GPUs idle during this wait.
+            worker.start(timeout=timeout, wait_ready=False)
+        if wait_ready:
+            # Launch staggering must not shorten the last worker's load budget.
+            deadline = time.monotonic() + timeout
+            for worker in workers:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        f"Workers for {model_id} did not become healthy within {timeout}s"
+                    )
+                worker.wait_ready(max(1, int(remaining)))
     except Exception:
         stop_workers(workers)
         raise

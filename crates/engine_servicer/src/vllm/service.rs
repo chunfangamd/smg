@@ -29,7 +29,8 @@ impl VllmEngine for VllmEngineService {
         &self,
         request: Request<vllm::GenerateRequest>,
     ) -> Result<Response<Self::GenerateStream>, Status> {
-        generate::generate(&self.state, request.into_inner())
+        let trace_headers = crate::trace_context::trace_headers(request.metadata());
+        generate::generate(&self.state, request.into_inner(), trace_headers)
             .await
             .map(Response::new)
     }
@@ -103,14 +104,9 @@ impl VllmEngine for VllmEngineService {
         &self,
         request: Request<common::SubscribeKvEventsRequest>,
     ) -> Result<Response<Self::SubscribeKvEventsStream>, Status> {
-        let model = &self.state.model;
-        if model.kv_events_endpoint.is_empty() {
+        let Some(relay) = &self.state.kv_relay else {
             return Err(Status::unimplemented(kv_events::VLLM_DISABLED_MESSAGE));
-        }
-        Ok(Response::new(kv_events::subscribe(
-            &model.kv_events_endpoint,
-            model.kv_events_topic.clone(),
-            request.into_inner(),
-        )))
+        };
+        relay.subscribe(request.into_inner()).map(Response::new)
     }
 }
