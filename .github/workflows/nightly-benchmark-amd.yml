@@ -101,7 +101,7 @@ jobs:
     name: "${{ matrix.model.id }} / single-${{ matrix.variant.id }}"
     needs: build-wheel
     if: ${{ !cancelled() && needs.build-wheel.result == 'success' }}
-    runs-on: ${{ vars.SMG_RUNNER_AMD_GPU_4 || '4-gpu-mi325x' }}
+    runs-on: ${{ vars.SMG_RUNNER_AMD_GPU_4 || '4-gpu-mi300x' }}
     container:
       image: ${{ matrix.variant.image }}
       options: ${{ vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN' }}
@@ -221,7 +221,7 @@ jobs:
     name: "${{ matrix.model.id }} / multi-${{ matrix.variant.id }}"
     needs: build-wheel
     if: ${{ !cancelled() && needs.build-wheel.result == 'success' }}
-    runs-on: ${{ vars.SMG_RUNNER_AMD_GPU_4 || '4-gpu-mi325x' }}
+    runs-on: ${{ vars.SMG_RUNNER_AMD_GPU_4 || '4-gpu-mi300x' }}
     container:
       image: ${{ matrix.variant.image }}
       options: ${{ vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN' }}
