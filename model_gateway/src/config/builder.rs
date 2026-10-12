@@ -154,6 +154,7 @@ impl RouterConfigBuilder {
     pub fn power_of_two_policy(mut self, load_check_interval_secs: u64) -> Self {
         self.config.policy = PolicyConfig::PowerOfTwo {
             load_check_interval_secs,
+            load_metric: Default::default(),
         };
         self
     }
@@ -276,6 +277,11 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn worker_stale_secs(mut self, secs: u64) -> Self {
+        self.config.worker_stale_secs = secs;
+        self
+    }
+
     pub fn worker_warmup(
         mut self,
         secs: u64,
@@ -366,7 +372,7 @@ impl RouterConfigBuilder {
         self
     }
 
-    /// Where media for vLLM gRPC workers is fetched and preprocessed.
+    /// Where media for one engine's gRPC workers is fetched and preprocessed.
     pub fn mm_processing(mut self, mode: Option<MmProcessingMode>) -> Self {
         self.config.mm_processing = mode;
         self
@@ -409,8 +415,9 @@ impl RouterConfigBuilder {
         self
     }
 
+    /// Remove the in-flight bound entirely (`max_concurrent_requests = 0`).
     pub fn disable_rate_limiting(mut self) -> Self {
-        self.config.max_concurrent_requests = -1;
+        self.config.max_concurrent_requests = 0;
         self
     }
 
@@ -441,6 +448,12 @@ impl RouterConfigBuilder {
 
     pub fn rate_limit_tokens_per_second(mut self, tokens: i32) -> Self {
         self.config.rate_limit_tokens_per_second = Some(tokens);
+        self
+    }
+
+    /// Most background Responses in flight at once (0 = background mode off).
+    pub fn max_background_responses(mut self, max: usize) -> Self {
+        self.config.max_background_responses = max;
         self
     }
 
@@ -730,6 +743,11 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn l0_cache_max_memory(mut self, max_memory: usize) -> Self {
+        self.config.tokenizer_cache.l0_max_memory = max_memory;
+        self
+    }
+
     pub fn enable_l1_cache(mut self, max_memory: usize) -> Self {
         self.config.tokenizer_cache.enable_l1 = true;
         self.config.tokenizer_cache.l1_max_memory = max_memory;
@@ -820,6 +838,11 @@ impl RouterConfigBuilder {
 
     pub fn maybe_log_dir(mut self, dir: Option<impl Into<String>>) -> Self {
         self.config.log_dir = dir.map(|d| d.into());
+        self
+    }
+
+    pub fn maybe_jemalloc_prof_dir(mut self, dir: Option<impl Into<String>>) -> Self {
+        self.config.jemalloc_prof_dir = dir.map(|d| d.into());
         self
     }
 

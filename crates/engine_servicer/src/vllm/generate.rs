@@ -4,7 +4,7 @@
 //! `Abort` RPC can end.
 
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     future::Future,
     pin::Pin,
     sync::{atomic::Ordering, Arc},
@@ -29,15 +29,19 @@ use crate::{
 };
 
 /// Handle one `Generate` request against the connected engine.
+/// `trace_headers` is the caller's W3C trace context (see
+/// [`crate::trace_context::trace_headers`]), handed to the engine request in
+/// the shape vLLM's own frontend hands its tracer.
 pub(super) async fn generate(
     state: &Arc<State>,
     req: vllm::GenerateRequest,
+    trace_headers: Option<BTreeMap<String, String>>,
 ) -> Result<BoxStream<vllm::GenerateResponse>, Status> {
     let client = state.engine()?;
     if req.request_id.is_empty() {
         return Err(Status::invalid_argument("request_id is required"));
     }
-    submit(state, client, req).await
+    submit(state, client, req, trace_headers).await
 }
 
 /// The rejection notice a refused PD decode leg owes its prefill side, so the
@@ -108,6 +112,7 @@ async fn submit(
     state: &Arc<State>,
     client: &ZmqEngineClient,
     mut req: vllm::GenerateRequest,
+    trace_headers: Option<BTreeMap<String, String>>,
 ) -> Result<BoxStream<vllm::GenerateResponse>, Status> {
     // A PD decode leg refused before admission still owes its prefill side
     // the notice: armed from the first refusal below until the engine can
@@ -169,7 +174,7 @@ async fn submit(
         _ => 0,
     };
     let subs = match client
-        .generate_vllm_streams_with_media(req, processed_media)
+        .generate_vllm_streams_with_media(req, processed_media, trace_headers)
         .await
     {
         Ok(subs) => subs,
