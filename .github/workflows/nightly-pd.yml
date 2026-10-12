@@ -46,7 +46,10 @@ jobs:
           # Mooncake next to its NIXL default, SGLang over NIXL next to its
           # Mooncake default (TokenSpeed only has Mooncake). The NIXL row skips
           # the peer-restart tests: the SGLang prefill segfaults when its decode
-          # comes back on the same address (#2503).
+          # comes back on the same address (#2503). vllm-amd is vLLM over NIXL
+          # and over MoRI-IO in WRITE mode; MoRI-IO's READ mode is left out
+          # while its decode faults on its first transfer over XGMI on AMD's
+          # MI300X runners (vllm-project/vllm#61144).
           matrix=$(printf '%s\n' $wanted | jq -Rsc '
             split("\n") | map(select(length > 0)) |
             map(if . == "vllm" then [{engine: "vllm"}, {engine: "vllm", kv_backend: "mooncake"}]
@@ -55,7 +58,6 @@ jobs:
                    filter: "not sole_leg_outage and not survives_losing"}]
                 elif . == "vllm-amd" then [
                   {engine: "vllm", kv_backend: "nixl", vendor: "amd"},
-                  {engine: "vllm", kv_backend: "moriio", moriio_mode: "read", vendor: "amd"},
                   {engine: "vllm", kv_backend: "moriio", moriio_mode: "write", vendor: "amd"}]
                 else [{engine: .}] end) | add')
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
@@ -167,12 +169,11 @@ jobs:
     with:
       engine: ${{ matrix.engine }}
       gpu_tier: "4"
-      runner: ${{ matrix.vendor == 'amd' && (vars.SMG_RUNNER_AMD_GPU_8 || '8-gpu-mi325x') || (vars.SMG_RUNNER_GPU_4 || '4-gpu-h100') }}
-      # The AMD rows run in vLLM's ROCm image, which ships NIXL, UCX and MoRI:
-      # v0.31.0 rather than the CI's vLLM pin, as vLLM registers its KV cache
-      # with MoRI-IO only from v0.29.0. The container gets the GPUs, the
-      # runner's model cache and its HF_TOKEN, but no RDMA devices, so MoRI-IO
-      # moves KV over XGMI.
+      runner: ${{ matrix.vendor == 'amd' && (vars.SMG_RUNNER_AMD_GPU_8 || '8-gpu-mi300x') || (vars.SMG_RUNNER_GPU_4 || '4-gpu-h100') }}
+      # The AMD rows run in vLLM's ROCm image of the CI's vLLM pin
+      # (scripts/ci_install_vllm.sh), which ships NIXL, UCX and MoRI. The
+      # container gets the GPUs, the runner's model cache and its HF_TOKEN, but
+      # no RDMA devices, so MoRI-IO moves KV over XGMI.
       gpu_vendor: ${{ matrix.vendor || 'nvidia' }}
       container_image: ${{ matrix.vendor == 'amd' && 'vllm/vllm-openai-rocm:v0.31.0' || '' }}
       container_options: ${{ matrix.vendor == 'amd' && (vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN') || '' }}

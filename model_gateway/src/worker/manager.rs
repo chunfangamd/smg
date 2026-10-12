@@ -28,6 +28,7 @@ use crate::{
     observability::metrics::{metrics_labels, Metrics},
     worker::{
         event::{WorkerConnected, WorkerEvent},
+        liveness,
         load_state::LoadSnapshot,
         metrics_aggregator::{self, MetricPack},
         registry::{WorkerDescriptor, WorkerId},
@@ -543,6 +544,9 @@ async fn apply_probe_completion(
             metrics_labels::CB_FAILURE
         },
     );
+    if probe_ok {
+        liveness::on_probe_passed(&worker);
+    }
 
     let Some(((), transition)) =
         registry.apply_if_revision(&worker_id, expected_revision, |current_worker| {
@@ -599,10 +603,12 @@ async fn recv_connect_signal(
     }
 }
 
-/// Promote a worker whose backend handshake just completed, without waiting
-/// for its next scheduled poll. Resolves the URL to a live worker id and flips
-/// the status through the revision-checked setter, so a signal that lost a race
-/// with a same-URL replacement — or a worker already removed — is discarded.
+/// Promote a worker whose backend handshake just completed, or that the
+/// health checker demoted and that has just answered a contact (see
+/// `worker::liveness::on_contact`), without waiting for its next scheduled
+/// poll. Resolves the URL to a live worker id and flips the status through the
+/// revision-checked setter, so a signal that lost a race with a same-URL
+/// replacement — or a worker already removed — is discarded.
 fn apply_connect_signal(
     registry: &Arc<WorkerRegistry>,
     connected: WorkerConnected,
@@ -614,6 +620,16 @@ fn apply_connect_signal(
         debug!(worker_url = %url, "Connect signal for an unknown worker; ignoring");
         return;
     };
+    // A Failed worker under removal is on its way out: the contact that
+    // signalled it was a last poll, not a return.
+    if config.remove_unhealthy
+        && registry
+            .get(&worker_id)
+            .is_some_and(|worker| worker.status() == WorkerStatus::Failed)
+    {
+        debug!(worker_url = %url, "Connect signal for a worker being removed; ignoring");
+        return;
+    }
     match registry.transition_status_if_revision(&worker_id, revision, WorkerStatus::Ready) {
         Some((old, new)) => {
             debug!(worker_url = %url, ?old, ?new, "Promoted worker on connect signal");
@@ -1209,6 +1225,7 @@ impl WorkerManager {
             dp_rank_count: loads.len() as i32,
             aggregate: EngineAggregateMetricsSnapshot::from_ranks(&loads),
             loads,
+            sampled_at: None,
         }
     }
 
@@ -1358,8 +1375,8 @@ mod tests {
 
     use super::*;
     use crate::worker::{
-        BasicWorkerBuilder, ConnectionMode, RuntimeType, Worker, WorkerError, WorkerRegistry,
-        WorkerType,
+        circuit_breaker::CircuitState, BasicWorkerBuilder, ConnectionMode, RuntimeType, Worker,
+        WorkerError, WorkerRegistry, WorkerType,
     };
 
     fn make_worker(url: &str, success_threshold: u32, failure_threshold: u32) -> Arc<dyn Worker> {
@@ -1383,6 +1400,53 @@ mod tests {
             default_check_interval_secs: 5,
             remove_unhealthy: false,
         }
+    }
+
+    /// The probes promote a demoted worker through `apply_probe_completion`,
+    /// not through `transition_status`: that path has to put the worker's
+    /// open circuit breaker on trial too, or a restarted engine is Ready and
+    /// still unroutable until the breaker's timeout.
+    #[tokio::test]
+    async fn a_passing_probe_run_readmits_a_demoted_worker_with_its_breaker_on_trial() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let worker = make_worker("http://w:1", 1, 1);
+        let worker_id = registry.register(worker.clone()).unwrap();
+        worker.set_status(WorkerStatus::Ready);
+
+        // The engine died: its requests failed until the breaker opened, and
+        // the probes demoted it.
+        for _ in 0..8 {
+            worker.record_circuit_breaker_outcome(false);
+        }
+        assert_eq!(worker.circuit_breaker_state(), CircuitState::Open);
+        worker.set_status(WorkerStatus::NotReady);
+        assert!(!worker.is_available());
+
+        // The engine is back on the same address: the first passing probe
+        // (success threshold 1) promotes the worker.
+        let completion = ProbeCompletion {
+            worker_id,
+            worker: worker.clone(),
+            expected_revision: worker.revision(),
+            launched_status: WorkerStatus::NotReady,
+            health_config: worker.metadata().health_config.clone(),
+            probe_result: Ok(()),
+        };
+        let applied = apply_probe_completion(&registry, completion, None).await;
+        assert!(matches!(
+            applied,
+            ProbeApplyResult::Applied(Some((WorkerStatus::NotReady, WorkerStatus::Ready)))
+        ));
+        assert_eq!(worker.status(), WorkerStatus::Ready);
+        assert_eq!(
+            worker.circuit_breaker_state(),
+            CircuitState::HalfOpen,
+            "the promotion puts the open breaker on trial instead of leaving it to its timeout"
+        );
+        assert!(
+            worker.is_available(),
+            "a worker promoted by its probes is routable at once"
+        );
     }
 
     fn make_zmq_worker(url: &str) -> Arc<dyn Worker> {
@@ -2181,6 +2245,7 @@ mod tests {
             dp_rank_count: loads.len() as i32,
             aggregate: None,
             loads,
+            sampled_at: None,
         }
     }
 
