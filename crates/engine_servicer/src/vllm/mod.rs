@@ -125,6 +125,36 @@ pub struct VllmModelInfo {
     /// `mm_device_do_normalize`, where the model supports it): advertised so
     /// the Router sends such an engine the pixels' own bytes.
     pub mm_device_do_normalize: bool,
+    /// The engine's per-prompt media limits (vLLM's `--limit-mm-per-prompt`)
+    /// as the `mm_item_limits` label the Router's media pipeline holds
+    /// requests to (`image=8,video=2`); empty when the engine has none.
+    pub mm_item_limits: String,
+    /// The scheduler's running window (`--max-num-seqs`) as the launcher read
+    /// it: how many requests the engine runs at once, which `GetServerInfo`
+    /// advertises as the bound the Router's PD admission gate claims decode
+    /// rooms against. The handshake's figure is the fallback for a launcher
+    /// that reported none.
+    pub max_num_seqs: i32,
+    /// The engine's reasoning parser (`--reasoning-parser`, "glm45", ...),
+    /// advertised as the `engine_reasoning_parser` label; empty when it runs
+    /// none.
+    pub engine_reasoning_parser: String,
+    /// Where the engine starts a request's grammar on a thinking prompt, as
+    /// the launcher read it off the structured-outputs config and the Router
+    /// shapes a forced tool call's grammar by (`structured_outputs_start`
+    /// label): `after_reasoning` when the engine waits for its reasoning
+    /// parser to see the thought's end, `first_token` when the grammar runs
+    /// from the first generated token; empty when the config does not say.
+    pub structured_outputs_start: String,
+    /// Whether the engine's scheduler statistics are on (vLLM's
+    /// `--disable-log-stats` not given), as the launcher started it: such an
+    /// engine's wire reports every scheduler step, and the pushed load record
+    /// says so (`engine_reports_steps`) from the first record rather than
+    /// from the first stats-only step batch, so an engine that freezes before
+    /// its first batch is judged on the step-reporting path too. `None` when
+    /// the launcher did not say (an older one): the wire is then classified
+    /// by what it shows.
+    pub log_stats: Option<bool>,
 }
 
 /// How to bind, where the engine dials in, and what to advertise.
@@ -137,6 +167,8 @@ pub struct VllmServicerConfig {
     pub ipc_base_url: String,
     /// `tcp://host:port` the headless engine dials for the handshake (its
     /// `--data-parallel-address`/`--data-parallel-rpc-port`).
+    /// An `ipc://<path>` endpoint is accepted too: one per test, so parallel
+    /// tests never share a probed TCP port.
     pub handshake_address: String,
     /// Engines that will dial in (the engine-level data-parallel size).
     pub engine_count: usize,
@@ -147,9 +179,14 @@ pub struct VllmServicerConfig {
     /// Worker-side media processing for `media_refs`; `None` refuses them, as
     /// the Python servicer does with `--mm-processor off`.
     pub media_processor: Option<Arc<dyn MediaProcessor>>,
-    /// Bound on the engine's startup handshake; see
-    /// [`crate::DEFAULT_ENGINE_STARTUP_TIMEOUT`].
+    /// Bound on silence during the engine's startup handshake: a handshake
+    /// message or a [`VllmServicerServer::note_engine_alive`] report resets
+    /// it; see [`crate::DEFAULT_ENGINE_STARTUP_TIMEOUT`].
     pub engine_startup_timeout: Duration,
+    /// Bound on the whole startup handshake however alive the engine is;
+    /// `None` leaves that to the silence bound and the lifecycle owner. See
+    /// [`crate::DEFAULT_ENGINE_STARTUP_CEILING`].
+    pub engine_startup_ceiling: Option<Duration>,
 }
 
 impl std::fmt::Debug for VllmServicerConfig {
@@ -179,9 +216,42 @@ pub(super) struct Stats {
     pub(super) generation_tokens: AtomicU64,
 }
 
+/// The servicer's `GetLoads` figures, read for the load record the relay
+/// attaches to every batch it streams.
+struct LoadFromState(std::sync::Weak<State>);
+
+impl crate::kv_events::LoadSource for LoadFromState {
+    fn load(&self, dp_rank: Option<i32>) -> Option<smg_grpc_client::common_proto::EngineLoad> {
+        let state = self.0.upgrade()?;
+        let response = info::loads(&state).ok()?;
+        let rank = dp_rank.unwrap_or(0);
+        let load = response
+            .loads
+            .iter()
+            .find(|load| load.dp_rank == rank)
+            .or_else(|| response.loads.first())?;
+        // The queued token-work is this servicer's estimate for the first
+        // rank (see `info::loads`); the other ranks do not report it.
+        let estimated = response.loads.first().map(|first| first.dp_rank) == Some(load.dp_rank);
+        let mut record = smg_grpc_client::common_proto::EngineLoad::from(load);
+        record.waiting_uncached_tokens =
+            estimated.then(|| u32::try_from(load.num_waiting_uncached_tokens).unwrap_or(0));
+        record.engine_silence_ms = state.engine.output_silence_ms();
+        record.engine_reports_steps = state.engine.reports_steps();
+        record.prefill_pending_tokens = state.engine.prefill_pending_tokens();
+        Some(record)
+    }
+}
+
 pub(super) struct State {
     pub(super) model: VllmModelInfo,
+    /// The KV-event relay for the engine's ZMQ publisher; `None` when events
+    /// are off (`SubscribeKvEvents` is then UNIMPLEMENTED).
+    pub(super) kv_relay: Option<Arc<crate::kv_events::KvEventRelay>>,
     pub(super) stats: Stats,
+    /// Queued token-work, generation throughput and hit rate from the
+    /// requests this servicer forwards, for `GetLoads`.
+    pub(super) loads: crate::load_tracker::LoadTracker,
     /// The local tokenizer directory the servicer loaded (`GetTokenizer`
     /// bundles it); `None` when none resolved.
     pub(super) tokenizer_dir: Option<String>,
@@ -276,8 +346,12 @@ impl VllmServicerServer {
         if !config.ipc_base_url.starts_with("ipc://") {
             return Err(invalid("ipc_base_url must be ipc://<path>"));
         }
-        if !config.handshake_address.starts_with("tcp://") {
-            return Err(invalid("handshake_address must be tcp://host:port"));
+        if !config.handshake_address.starts_with("tcp://")
+            && !config.handshake_address.starts_with("ipc://")
+        {
+            return Err(invalid(
+                "handshake_address must be tcp://host:port or ipc://<path>",
+            ));
         }
         if config.engine_count == 0 {
             return Err(invalid("engine_count must be positive"));
@@ -285,13 +359,26 @@ impl VllmServicerServer {
         if config.engine_startup_timeout.is_zero() {
             return Err(invalid("engine_startup_timeout must be positive"));
         }
+        if config
+            .engine_startup_ceiling
+            .is_some_and(|ceiling| ceiling.is_zero())
+        {
+            return Err(invalid("engine_startup_ceiling must be positive when set"));
+        }
         if config.model.model_path.trim().is_empty() {
             return Err(invalid("model_path must not be empty"));
         }
+        let kv_relay = crate::kv_events::KvEventRelay::for_publisher(
+            &config.model.kv_events_endpoint,
+            Some(&config.model.kv_events_replay_endpoint),
+            &config.model.kv_events_topic,
+        );
         let state = Arc::new(State {
             tokenizer_dir: config.tokenizer_dir.clone(),
             model: config.model,
+            kv_relay,
             stats: Stats::default(),
+            loads: crate::load_tracker::LoadTracker::default(),
             engine: EngineLink::default(),
             tokenizer: OnceLock::new(),
             registry: Arc::new(RequestRegistry::default()),
@@ -299,6 +386,9 @@ impl VllmServicerServer {
             started: Instant::now(),
             media: config.media_processor.map(MediaGate::new),
         });
+        if let Some(relay) = &state.kv_relay {
+            relay.set_load_source(Arc::new(LoadFromState(Arc::downgrade(&state))));
+        }
         if let Some(tokenizer) = tokenizer {
             let _ = state.tokenizer.set(Some(tokenizer));
         }
@@ -312,6 +402,7 @@ impl VllmServicerServer {
         );
         let connect_state = Arc::clone(&state);
         let stats_state = Arc::clone(&state);
+        let kv_relay = state.kv_relay.clone();
         let VllmServicerConfig {
             bind_address,
             ipc_base_url,
@@ -319,12 +410,19 @@ impl VllmServicerServer {
             engine_count,
             tokenizer_dir,
             engine_startup_timeout,
+            engine_startup_ceiling,
             ..
         } = config;
         let thread = ServerThread::start(
             "smg-vllm-servicer",
             &bind_address,
             move |listener: TcpListener, shutdown: Shutdown, last_error| async move {
+                // The KV-event relay follows the publisher from the start,
+                // before any gateway asks, so its history and live-block
+                // record cover the engine's whole life.
+                if let Some(relay) = &kv_relay {
+                    relay.start_at_boot();
+                }
                 // Fire-and-forget on the server runtime: dropping the runtime
                 // with the server thread cancels a still-running connect.
                 #[expect(
@@ -337,6 +435,7 @@ impl VllmServicerServer {
                     handshake_address,
                     engine_count,
                     engine_startup_timeout,
+                    engine_startup_ceiling,
                     tokenizer_dir,
                     last_error,
                 ));
@@ -408,6 +507,18 @@ impl VllmServicerServer {
     /// Whether the engine handshake completed.
     pub fn engine_ready(&self) -> bool {
         self.state.engine.client.get().is_some()
+    }
+
+    /// Report a sign of life from the engine process while the handshake
+    /// runs: the lifecycle owner that launched it calls this each time it
+    /// polls the process and finds it alive. Each report resets the
+    /// handshake's silence bound (`engine_startup_timeout`); the ceiling
+    /// (`engine_startup_ceiling`) still holds. A no-op once the engine is
+    /// connected.
+    pub fn note_engine_alive(&self) {
+        if !self.engine_ready() {
+            self.state.engine.liveness.touch();
+        }
     }
 
     pub fn last_error(&self) -> Result<Option<String>, ServicerError> {

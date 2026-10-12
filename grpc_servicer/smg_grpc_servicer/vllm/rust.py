@@ -8,10 +8,11 @@ parser as a vLLM general plugin, see :mod:`smg_grpc_servicer.vllm.plugin`) keeps
 entrypoint but hands the process to :func:`serve_rust` before an AsyncLLM or
 a Python gRPC server exists: the ``vllm.grpc.engine.VllmEngine`` contract is
 served by the Rust :class:`smg.servicer.VllmGrpcServer` on a Rust-owned
-thread, and the engine runs headless in a spawned child, launched through
-vLLM's own ``run_headless`` from the launcher's parsed namespace, dialing the
-servicer's same-host ZMQ handshake. Python keeps the lifecycle only. The
-Router cannot tell the two implementations apart.
+thread, and the engine cores are started from this same process (vLLM's own
+``CoreEngineProcManager``, built from the launcher's parsed namespace the way
+``vllm serve --headless`` builds it), dialing the servicer's same-host ZMQ
+handshake. Python keeps the lifecycle only. The Router cannot tell the two
+implementations apart.
 
 The switch runs ahead of the launcher's ``serve_grpc`` without a vLLM
 change: the launcher imports this package's servicer classes at module
@@ -48,21 +49,28 @@ import os
 from collections.abc import Mapping, MutableMapping
 from typing import Any
 
+from smg_grpc_servicer.hostport import host_port
 from smg_grpc_servicer.rust_lifecycle import (
     DEFAULT_DRAIN_SECS,
+    DEFAULT_STARTUP_CEILING_SECS,
     DEFAULT_STARTUP_TIMEOUT_SECS,
     EngineProcess,
+    EngineProcessGroup,
     default_socket_dir,
     free_port,
     resolve_tokenizer_dir,
     supervise,
 )
 from smg_grpc_servicer.rust_lifecycle import env_float as _env_float
+from smg_grpc_servicer.vllm.media_refs import FETCHABLE_MODALITIES
 from smg_grpc_servicer.vllm.model_info import (
+    engine_reasoning_parser,
     eos_token_ids_with_generation_config,
     mm_device_do_normalize,
+    mm_item_limits,
     model_facts,
     server_facts,
+    structured_outputs_start,
 )
 
 logger = logging.getLogger(__name__)
@@ -71,18 +79,34 @@ SERVICER_IMPL_ENV = "SMG_VLLM_SERVICER_IMPL"
 HANDSHAKE_PORT_ENV = "SMG_VLLM_SERVICER_HANDSHAKE_PORT"
 DRAIN_SECS_ENV = "SMG_VLLM_SERVICER_DRAIN_SECS"
 STARTUP_TIMEOUT_SECS_ENV = "SMG_VLLM_SERVICER_STARTUP_TIMEOUT_SECS"
+STARTUP_CEILING_SECS_ENV = "SMG_VLLM_SERVICER_STARTUP_CEILING_SECS"
+# Set to 0/false/no/off to keep vLLM's KV event publisher off when the
+# launcher was given no --kv-events-config (see `default_kv_events_config`).
+KV_EVENTS_ENV = "SMG_VLLM_SERVICER_KV_EVENTS"
+_OFF_VALUES = ("0", "false", "no", "off")
+# vLLM's own knob for how it starts its processes; the engine cores launched
+# from this process are spawned unless the deployment chose otherwise.
+MULTIPROC_METHOD_ENV = "VLLM_WORKER_MULTIPROC_METHOD"
 IMPLS = ("python", "rust")
 # What upstream's gRPC entrypoint references when it carries the switch.
 HOOK_SYMBOL = "resolve_servicer_impl"
 
 
-def model_info_from_config(vllm_config: Any) -> dict[str, Any]:
+def model_info_from_config(vllm_config: Any, *, log_stats: bool | None = None) -> dict[str, Any]:
     """`VllmGrpcServer` keyword arguments from vLLM's own config: the facts
     both servicers advertise (`model_facts`, `server_facts`), plus the inputs
     only the Rust servicer needs up front because no Python runs on its
-    request path."""
+    request path. ``log_stats`` is whether the engine cores are started with
+    their scheduler statistics on (``--disable-log-stats`` not given): such
+    an engine's wire reports every scheduler step, which the servicer's
+    pushed load records say from the first record; ``None`` leaves the
+    servicer to classify the wire by what it shows."""
     model_config = vllm_config.model_config
     facts = {**model_facts(model_config), **server_facts(vllm_config)}
+    # `server_facts` carries the multimodal encoder dtype for the Python
+    # servicer's GetServerInfo; the Rust servicer derives it from `model_dtype`
+    # itself, by the same rule, and its binding takes no such keyword.
+    facts.pop("multimodal_encoder_dtype", None)
     # KV-event publishing, as the Python servicer resolves it: only vLLM's ZMQ
     # publisher can be relayed; anything else leaves SubscribeKvEvents off.
     kv_events = getattr(vllm_config, "kv_events_config", None)
@@ -123,7 +147,43 @@ def model_info_from_config(vllm_config: Any) -> dict[str, Any]:
         ),
         "pooler_dimensions": int(pooler_dimensions) if pooler_dimensions is not None else None,
         "mm_device_do_normalize": mm_device_do_normalize(vllm_config),
+        "mm_item_limits": mm_item_limits(vllm_config),
+        "engine_reasoning_parser": engine_reasoning_parser(vllm_config),
+        "structured_outputs_start": structured_outputs_start(vllm_config),
+        "log_stats": log_stats,
     }
+
+
+def default_kv_events_config(
+    args: argparse.Namespace, environ: Mapping[str, str] | None = None
+) -> Any | None:
+    """Turn vLLM's KV event publisher on when the launcher was given no
+    ``--kv-events-config``; returns the configuration applied, or None.
+
+    Cache-aware routing lives on the events ``SubscribeKvEvents`` relays, and
+    vLLM publishes none unless started with ``--kv-events-config
+    '{"enable_kv_cache_events": true, "publisher": "zmq"}'``: a launcher
+    without it got a router that routed blind, with one WARN per worker as
+    the only trace. Under the Rust servicer the namespace that lacks the
+    option gets exactly that configuration (vLLM's own defaults for the rest:
+    the ZMQ endpoint and its port, the topic), before the engine args and the
+    engine cores are built from it, so publisher and relay agree. An explicit
+    ``--kv-events-config`` is kept as given, off included;
+    ``SMG_VLLM_SERVICER_KV_EVENTS=0`` keeps the publisher off without one.
+    """
+    source = os.environ if environ is None else environ
+    if getattr(args, "kv_events_config", None) is not None:
+        return None
+    if str(source.get(KV_EVENTS_ENV, "")).strip().lower() in _OFF_VALUES:
+        return None
+    try:
+        from vllm.config import KVEventsConfig
+
+        config: Any = KVEventsConfig(enable_kv_cache_events=True, publisher="zmq")
+    except ImportError:  # the launcher's parser hands the config over as JSON too
+        config = {"enable_kv_cache_events": True, "publisher": "zmq"}
+    args.kv_events_config = config
+    return config
 
 
 def smg_media_options(vllm_config, settings, tokenizer_dir: str | None) -> dict[str, Any] | None:
@@ -139,7 +199,18 @@ def smg_media_options(vllm_config, settings, tokenizer_dir: str | None) -> dict[
     The engine's ``mm_processor_kwargs`` go along as overrides of the
     preprocessor config (less ``device``, which only says where vLLM's own
     processor would run); a knob the pipeline has no field for is refused
-    at launch rather than silently ignored.
+    at launch rather than silently ignored. The engine's own per-prompt media
+    limits (``--limit-mm-per-prompt``) go along too: the pipeline refuses
+    above them as the engine's own server does, whatever its own caps say. So
+    does the engine's video frame budget (``--media-io-kwargs``
+    ``video.num_frames``, else its loader's default), so a clip costs the same
+    tokens as on the engine's own server for the families whose processor
+    takes the loader's frames (unless ``SMG_VLLM_MM_MAX_VIDEO_FRAMES`` caps the
+    budget below the engine's count, when the pipeline samples fewer frames
+    than the engine's server would, as the cap intends); a sampling rule of
+    the loader the pipeline cannot follow goes along by name
+    (``video_loader_rule``), and the pipeline refuses it for those families
+    only.
     """
     model_config = vllm_config.model_config
     if not getattr(model_config, "is_multimodal_model", False):
@@ -169,13 +240,99 @@ def smg_media_options(vllm_config, settings, tokenizer_dir: str | None) -> dict[
         ),
         "max_inflight": settings.max_inflight,
         "max_items": settings.max_items,
+        "engine_item_limits": engine_item_limits(model_config),
         "max_item_bytes": settings.max_item_bytes,
+        "video_frame_budget": video_frame_budget(model_config),
+        "video_loader_rule": video_loader_rule(model_config),
         "source": settings.source,
     }
 
 
+def engine_item_limits(model_config) -> dict[str, int] | None:
+    """The engine's per-prompt media limits for the modalities the pipeline
+    fetches, as vLLM resolved ``--limit-mm-per-prompt`` (its own server refuses
+    a prompt above them); ``None`` on a config that does not carry them, which
+    leaves the pipeline to its own caps."""
+    mm_config = getattr(model_config, "multimodal_config", None)
+    get_limit = getattr(mm_config, "get_limit_per_prompt", None)
+    if not callable(get_limit):
+        return None
+    return {modality: int(get_limit(modality)) for modality in FETCHABLE_MODALITIES}
+
+
+def video_frame_budget(model_config, environ: Mapping[str, str] | None = None) -> int | None:
+    """The number of frames the engine's own loader samples a video to: its
+    ``--media-io-kwargs`` ``video.num_frames`` when set (``0`` for a non-positive
+    count, which vLLM reads as every frame), else the loader's default, under
+    the same ``SMG_VLLM_MM_MAX_VIDEO_FRAMES`` cap the other processors apply
+    (``clamp_video_frames``); ``None`` when neither is known, which leaves the
+    pipeline's spec to its own constant. A sampling rule of the loader that the
+    pipeline cannot follow is reported by ``video_loader_rule``, not here."""
+    from smg_grpc_servicer.vllm.mm_processor import (
+        DEFAULT_MAX_VIDEO_FRAMES,
+        ENV_MAX_VIDEO_FRAMES,
+        clamp_video_frames,
+        env_int,
+        vllm_default_video_frames,
+    )
+
+    source = os.environ if environ is None else environ
+    mm_config = getattr(model_config, "multimodal_config", None)
+    kwargs = getattr(mm_config, "media_io_kwargs", None) or {}
+    if not isinstance(kwargs, Mapping):
+        kwargs = {}
+    default = vllm_default_video_frames()
+    max_frames = env_int(source, ENV_MAX_VIDEO_FRAMES, DEFAULT_MAX_VIDEO_FRAMES, minimum=0)
+    capped = clamp_video_frames(kwargs, max_frames, default) or {}
+    video = capped.get("video") if isinstance(capped, Mapping) else None
+    num_frames = video.get("num_frames") if isinstance(video, Mapping) else None
+    if num_frames is None:
+        num_frames = default
+    if num_frames is None:
+        return None
+    return max(int(num_frames), 0)
+
+
+def video_loader_rule(model_config, environ: Mapping[str, str] | None = None) -> str | None:
+    """A sampling rule of the engine's video loader that the smg pipeline
+    cannot follow, named the way the launcher was given it, or ``None``: a
+    loader other than the default ``opencv`` (``video.video_backend`` in
+    ``--media-io-kwargs``, else ``VLLM_VIDEO_LOADER_BACKEND``, in vLLM's own
+    order of precedence), or a ``video.fps``
+    above zero, which thins the frames by the clip's duration (vLLM's default
+    ``-1`` and ``0`` do not). The pipeline refuses the rule at launch for a
+    family that samples the way the loader does (Gemma 4); the families with a
+    rate-based sampler of their own never followed the loader and start as
+    before, so a fleet-wide loader setting does not block them."""
+    source = os.environ if environ is None else environ
+    mm_config = getattr(model_config, "multimodal_config", None)
+    kwargs = getattr(mm_config, "media_io_kwargs", None) or {}
+    video = kwargs.get("video") if isinstance(kwargs, Mapping) else None
+    video = video if isinstance(video, Mapping) else {}
+    rules: list[str] = []
+    # vLLM takes the kwarg over the environment (`kwargs.pop("video_backend")
+    # or envs.VLLM_VIDEO_LOADER_BACKEND`), so only the loader it ends up with
+    # counts: a kwarg naming opencv silences a fleet-wide environment setting.
+    backend = video.get("video_backend")
+    loader = (source.get("VLLM_VIDEO_LOADER_BACKEND") or "").strip()
+    if backend is not None:
+        if str(backend).strip().lower() != "opencv":
+            rules.append(f"--media-io-kwargs video.video_backend={backend}")
+    elif loader and loader.lower() != "opencv":
+        rules.append(f"VLLM_VIDEO_LOADER_BACKEND={loader}")
+    fps = video.get("fps")
+    if fps is not None:
+        try:
+            thins = float(fps) > 0
+        except (TypeError, ValueError):
+            thins = True
+        if thins:
+            rules.append(f"--media-io-kwargs video.fps={fps}")
+    return "; ".join(rules) or None
+
+
 # ---------------------------------------------------------------------------
-# Headless engine: upstream's own launch, from the parsed namespace
+# Headless engine: upstream's own engine-core launch, from the parsed namespace
 # ---------------------------------------------------------------------------
 
 
@@ -236,13 +393,86 @@ def _run_headless(ns: argparse.Namespace) -> None:
 
 
 def launch_headless_engine(ns: argparse.Namespace) -> EngineProcess:
-    """Start the headless engine in a spawned child: a fresh interpreter that
-    inherits no Rust thread and never consults the servicer switch again
-    (it enters ``run_headless`` directly, not ``serve_grpc``)."""
+    """Start vLLM's headless launcher in a spawned child: a fresh interpreter
+    that inherits no Rust thread and never consults the servicer switch again
+    (it enters ``run_headless`` directly, not ``serve_grpc``). Only the cases
+    the launcher alone serves go this way (see :func:`launch_engine_cores`):
+    the child is a second full Python/torch process per engine pod."""
     context = multiprocessing.get_context("spawn")
     process = context.Process(target=_run_headless, args=(ns,), name="smg-headless-engine")
     process.start()
     return EngineProcess(process)
+
+
+def launch_engine_cores(ns: argparse.Namespace) -> EngineProcessGroup | EngineProcess:
+    """Start the engine cores from this process, the way vLLM's headless
+    launcher (``run_headless``) starts them on the head node: the headless
+    engine config from the same namespace, then ``CoreEngineProcManager``
+    with every engine local and the servicer's handshake address. This
+    process has already imported vLLM and torch for the servicer's own
+    config, so hosting the launch here costs no second interpreter, where
+    the spawned launcher was a full Python/torch process per engine pod,
+    idle once the cores ran.
+
+    The cores are started by vLLM's own process manager, spawned rather than
+    forked: this process hosts the Rust runtime's threads, which no child may
+    inherit (the Python servicer's process ends up spawning them too, vLLM
+    forces it there once CUDA is initialized). The launcher keeps the cases
+    only it serves: the worker ranks of a multi-node engine
+    (``node_rank_within_dp > 0``) and the ray data-parallel backend go through
+    :func:`launch_headless_engine` unchanged.
+    """
+    from vllm.engine.arg_utils import AsyncEngineArgs
+    from vllm.usage.usage_lib import UsageContext
+
+    engine_args = AsyncEngineArgs.from_cli_args(ns)
+    vllm_config = engine_args.create_engine_config(
+        usage_context=UsageContext.OPENAI_API_SERVER, headless=True
+    )
+    parallel_config = vllm_config.parallel_config
+    node_rank = getattr(parallel_config, "node_rank_within_dp", 0)
+    backend = getattr(parallel_config, "data_parallel_backend", "mp")
+    if node_rank > 0 or backend == "ray":
+        logger.info(
+            "Engine launch left to vLLM's headless launcher in a spawned process "
+            "(node rank %d within the data-parallel group, backend %s)",
+            node_rank,
+            backend,
+        )
+        return launch_headless_engine(ns)
+
+    from vllm.utils.network_utils import get_tcp_uri
+    from vllm.v1.engine.utils import CoreEngineProcManager
+    from vllm.v1.executor import Executor
+
+    # vLLM's default start method is fork; an explicit choice is kept.
+    if os.environ.setdefault(MULTIPROC_METHOD_ENV, "spawn") != "spawn":
+        logger.warning(
+            "%s=%s: the engine cores are forked from the servicer process",
+            MULTIPROC_METHOD_ENV,
+            os.environ[MULTIPROC_METHOD_ENV],
+        )
+    manager = CoreEngineProcManager(
+        local_engine_count=parallel_config.data_parallel_size_local,
+        start_index=parallel_config.data_parallel_rank,
+        local_start_index=0,
+        vllm_config=vllm_config,
+        local_client=False,
+        handshake_address=get_tcp_uri(
+            parallel_config.data_parallel_master_ip, parallel_config.data_parallel_rpc_port
+        ),
+        executor_class=Executor.get_class(vllm_config),
+        log_stats=not engine_args.disable_log_stats,
+    )
+    # The engine's own request-drain budget bounds the shutdown when one is
+    # configured; otherwise the manager's best-effort grace applies.
+    engines = EngineProcessGroup(manager, shutdown_timeout=vllm_config.shutdown_timeout or None)
+    logger.info(
+        "Started %d engine core process(es) from the servicer process: pids %s",
+        len(engines.pids),
+        ", ".join(str(pid) for pid in engines.pids),
+    )
+    return engines
 
 
 # ---------------------------------------------------------------------------
@@ -252,7 +482,7 @@ def launch_headless_engine(ns: argparse.Namespace) -> EngineProcess:
 
 async def serve_rust(args: argparse.Namespace) -> int:
     """Serve this process's gRPC contract from Rust: start the Rust server,
-    launch the headless engine from the same parsed namespace, and supervise
+    launch the engine cores from the same parsed namespace, and supervise
     both. ``args`` is the upstream launcher's namespace (``--host``/``--port``
     plus ``AsyncEngineArgs``, and the frontend fields under ``vllm serve``).
     Returns the process exit code."""
@@ -261,9 +491,29 @@ async def serve_rust(args: argparse.Namespace) -> int:
     from vllm.usage.usage_lib import UsageContext
 
     configure_logging()
+    if default_kv_events_config(args) is not None:
+        logger.info(
+            "KV event publishing enabled: no --kv-events-config was given, so vLLM's ZMQ "
+            "publisher is on with its default endpoint and SubscribeKvEvents relays it; pass "
+            "--kv-events-config to configure it, or set %s=0 to leave it off",
+            KV_EVENTS_ENV,
+        )
     engine_args = AsyncEngineArgs.from_cli_args(args)
     vllm_config = engine_args.create_engine_config(usage_context=UsageContext.OPENAI_API_SERVER)
-    info = model_info_from_config(vllm_config)
+    # The engine cores are started with `log_stats=not disable_log_stats`
+    # below (`launch_engine_cores`); the servicer is told the same.
+    disable_log_stats = getattr(engine_args, "disable_log_stats", None)
+    info = model_info_from_config(
+        vllm_config,
+        log_stats=None if disable_log_stats is None else not disable_log_stats,
+    )
+    if info["kv_events_endpoint"]:
+        logger.info("SubscribeKvEvents relays vLLM's KV events from %s", info["kv_events_endpoint"])
+    else:
+        logger.warning(
+            "SubscribeKvEvents is off (KV cache events disabled, or a publisher other than "
+            "zmq): a cache-aware router sees nothing of this engine's cache"
+        )
     model_config = vllm_config.model_config
     tokenizer_dir = resolve_tokenizer_dir(
         str(getattr(model_config, "tokenizer", None) or model_config.model),
@@ -293,18 +543,19 @@ async def serve_rust(args: argparse.Namespace) -> int:
     )
 
     init_servicer_tracing()
+    startup_timeout_secs = _env_float(STARTUP_TIMEOUT_SECS_ENV, DEFAULT_STARTUP_TIMEOUT_SECS)
+    startup_ceiling_secs = _env_float(STARTUP_CEILING_SECS_ENV, DEFAULT_STARTUP_CEILING_SECS)
     server = VllmGrpcServer(
         # `vllm serve` leaves host unset and upstream binds all interfaces then.
-        bind_address=f"{getattr(args, 'host', None) or '0.0.0.0'}:{args.port}",
+        bind_address=host_port(getattr(args, "host", None) or "0.0.0.0", args.port),
         # Per process, not per requested port: `--port 0` launchers would
         # otherwise share one path and unlink each other's sockets.
         ipc_base_url=f"ipc://{socket_dir}/servicer-{os.getpid()}",
         handshake_address=f"tcp://127.0.0.1:{handshake_port}",
         engine_count=data_parallel_size,
         tokenizer_dir=tokenizer_dir,
-        engine_startup_timeout_secs=_env_float(
-            STARTUP_TIMEOUT_SECS_ENV, DEFAULT_STARTUP_TIMEOUT_SECS
-        ),
+        engine_startup_timeout_secs=startup_timeout_secs,
+        engine_startup_ceiling_secs=startup_ceiling_secs,
         media_processor=media,
         smg_media_processor=smg_media,
         **info,
@@ -315,8 +566,16 @@ async def serve_rust(args: argparse.Namespace) -> int:
         handshake_port,
         data_parallel_size,
     )
+    logger.info(
+        "Engine startup bounds: %.0fs without a sign of life (%s), ceiling %s (%s); "
+        "the handshake waits while the engine process is alive",
+        startup_timeout_secs,
+        STARTUP_TIMEOUT_SECS_ENV,
+        f"{startup_ceiling_secs:.0f}s" if startup_ceiling_secs else "none",
+        STARTUP_CEILING_SECS_ENV,
+    )
     try:
-        engine = launch_headless_engine(
+        engine = launch_engine_cores(
             headless_namespace(
                 args, handshake_port=handshake_port, data_parallel_size=data_parallel_size
             )

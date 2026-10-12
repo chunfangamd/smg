@@ -83,6 +83,16 @@ pub struct SglangModelInfo {
     /// The data-parallel size the launcher configured; the handshake's figure
     /// wins once the engines are up.
     pub data_parallel_size: i32,
+    /// SGLang's `--kv-events-config` ZMQ publisher endpoint as configured
+    /// (`tcp://*:5557` style, rank 0's port), or empty when events are off;
+    /// `SubscribeKvEvents` relays it through [`crate::kv_wire`]'s rules.
+    pub kv_events_endpoint: String,
+    /// The same config's `replay_endpoint` (SGLang's replay ROUTER), or
+    /// empty when it runs none: what the relay asks for gaps in flight and
+    /// for the batches published before its subscription joined.
+    pub kv_events_replay_endpoint: String,
+    /// The publisher's topic prefix (empty by default).
+    pub kv_events_topic: String,
 }
 
 /// How to bind, where the engines dial in, and what to advertise.
@@ -95,6 +105,8 @@ pub struct SglangServicerConfig {
     pub ipc_base_url: String,
     /// `tcp://host:port` the headless scheduler dials for the handshake (the
     /// launcher's `--zmq-handshake-address`).
+    /// An `ipc://<path>` endpoint is accepted too: one per test, so parallel
+    /// tests never share a probed TCP port.
     pub handshake_address: String,
     /// Engines that will dial in (the data-parallel size).
     pub engine_count: usize,
@@ -102,13 +114,40 @@ pub struct SglangServicerConfig {
     /// `GetTokenizer`; the scheduler keeps its own tokenizer for stop strings.
     pub tokenizer_dir: Option<String>,
     pub model: SglangModelInfo,
-    /// Bound on the scheduler's startup handshake; see
-    /// [`crate::DEFAULT_ENGINE_STARTUP_TIMEOUT`].
+    /// Bound on silence during the scheduler's startup handshake: a handshake
+    /// message or a [`SglangServicerServer::note_engine_alive`] report resets
+    /// it; see [`crate::DEFAULT_ENGINE_STARTUP_TIMEOUT`].
     pub engine_startup_timeout: Duration,
+    /// Bound on the whole startup handshake however alive the scheduler is;
+    /// `None` leaves that to the silence bound and the lifecycle owner. See
+    /// [`crate::DEFAULT_ENGINE_STARTUP_CEILING`].
+    pub engine_startup_ceiling: Option<Duration>,
+}
+
+/// The servicer's `GetLoads` figures, read for the load record the relay
+/// attaches to every batch it streams.
+struct LoadFromState(std::sync::Weak<State>);
+
+impl crate::kv_events::LoadSource for LoadFromState {
+    fn load(&self, dp_rank: Option<i32>) -> Option<smg_grpc_client::common_proto::EngineLoad> {
+        let state = self.0.upgrade()?;
+        let response = info::loads(&state, dp_rank).ok()?;
+        let load = response.loads.first()?;
+        // The engine reports no queued token-work on this wire yet: the
+        // record's `waiting_uncached_tokens` stays unset.
+        let mut record = smg_grpc_client::common_proto::EngineLoad::from(load);
+        record.engine_silence_ms = state.engine.output_silence_ms();
+        record.engine_reports_steps = state.engine.reports_steps();
+        record.prefill_pending_tokens = state.engine.prefill_pending_tokens();
+        Some(record)
+    }
 }
 
 pub(super) struct State {
     pub(super) model: SglangModelInfo,
+    /// The KV-event relay for the engine's ZMQ publisher; `None` when events
+    /// are off (`SubscribeKvEvents` is then UNIMPLEMENTED).
+    pub(super) kv_relay: Option<Arc<crate::kv_events::KvEventRelay>>,
     /// The local tokenizer directory `GetTokenizer` bundles; `None` when none
     /// resolved.
     pub(super) tokenizer_dir: Option<String>,
@@ -173,14 +212,24 @@ impl SglangServicerServer {
         if !config.ipc_base_url.starts_with("ipc://") {
             return Err(invalid("ipc_base_url must be ipc://<path>"));
         }
-        if !config.handshake_address.starts_with("tcp://") {
-            return Err(invalid("handshake_address must be tcp://host:port"));
+        if !config.handshake_address.starts_with("tcp://")
+            && !config.handshake_address.starts_with("ipc://")
+        {
+            return Err(invalid(
+                "handshake_address must be tcp://host:port or ipc://<path>",
+            ));
         }
         if config.engine_count == 0 {
             return Err(invalid("engine_count must be positive"));
         }
         if config.engine_startup_timeout.is_zero() {
             return Err(invalid("engine_startup_timeout must be positive"));
+        }
+        if config
+            .engine_startup_ceiling
+            .is_some_and(|ceiling| ceiling.is_zero())
+        {
+            return Err(invalid("engine_startup_ceiling must be positive when set"));
         }
         if config.model.model_path.trim().is_empty() {
             return Err(invalid("model_path must not be empty"));
@@ -195,15 +244,24 @@ impl SglangServicerServer {
                 return Err(invalid(&format!("{name} must be a JSON object")));
             }
         }
+        let kv_relay = crate::kv_events::KvEventRelay::for_publisher(
+            &config.model.kv_events_endpoint,
+            Some(&config.model.kv_events_replay_endpoint),
+            &config.model.kv_events_topic,
+        );
         let state = Arc::new(State {
             tokenizer_dir: config.tokenizer_dir.clone(),
             model: config.model,
+            kv_relay,
             engine: EngineLink::default(),
             registry: Arc::new(RequestRegistry::default()),
             serving: AtomicBool::new(true),
             started: Instant::now(),
             started_at: SystemTime::now(),
         });
+        if let Some(relay) = &state.kv_relay {
+            relay.set_load_source(Arc::new(LoadFromState(Arc::downgrade(&state))));
+        }
         let service = service::SglangService {
             state: Arc::clone(&state),
         };
@@ -213,18 +271,26 @@ impl SglangServicerServer {
             Arc::new(move || health_state.is_serving()),
         );
         let connect_state = Arc::clone(&state);
+        let kv_relay = state.kv_relay.clone();
         let SglangServicerConfig {
             bind_address,
             ipc_base_url,
             handshake_address,
             engine_count,
             engine_startup_timeout,
+            engine_startup_ceiling,
             ..
         } = config;
         let thread = ServerThread::start(
             "smg-sglang-servicer",
             &bind_address,
             move |listener: TcpListener, shutdown: Shutdown, last_error| async move {
+                // The KV-event relay follows the publisher from the start,
+                // before any gateway asks, so its history and live-block
+                // record cover the engine's whole life.
+                if let Some(relay) = &kv_relay {
+                    relay.start_at_boot();
+                }
                 #[expect(
                     clippy::disallowed_methods,
                     reason = "engine connect is fire-and-forget; the runtime drop cancels it"
@@ -235,6 +301,7 @@ impl SglangServicerServer {
                     handshake_address,
                     engine_count,
                     engine_startup_timeout,
+                    engine_startup_ceiling,
                     last_error,
                 ));
                 info!(address = %listener.local_addr().map(|a| a.to_string()).unwrap_or_default(), "SGLang gRPC servicer listening");
@@ -291,6 +358,18 @@ impl SglangServicerServer {
     /// Whether the engine handshake completed.
     pub fn engine_ready(&self) -> bool {
         self.state.engine.client.get().is_some()
+    }
+
+    /// Report a sign of life from the scheduler process while the handshake
+    /// runs: the lifecycle owner that launched it calls this each time it
+    /// polls the process and finds it alive. Each report resets the
+    /// handshake's silence bound (`engine_startup_timeout`); the ceiling
+    /// (`engine_startup_ceiling`) still holds. A no-op once the scheduler is
+    /// connected.
+    pub fn note_engine_alive(&self) {
+        if !self.engine_ready() {
+            self.state.engine.liveness.touch();
+        }
     }
 
     pub fn last_error(&self) -> Result<Option<String>, ServicerError> {

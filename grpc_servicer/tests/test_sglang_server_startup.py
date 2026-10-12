@@ -8,6 +8,7 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
+from smg_grpc_proto import sglang_scheduler_pb2 as pb
 
 
 def _module(name, **attrs):
@@ -88,6 +89,7 @@ def server_mod(monkeypatch):
         "smg_grpc_servicer.sglang.request_manager": _module(
             "smg_grpc_servicer.sglang.request_manager",
             GrpcRequestManager=object,
+            init_request_tracing=lambda: False,
         ),
         "smg_grpc_servicer.sglang.scheduler_launcher": _module(
             "smg_grpc_servicer.sglang.scheduler_launcher",
@@ -222,6 +224,51 @@ def test_scheduler_launch_failure_never_starts_serving(monkeypatch, server_mod):
     grpc_server_factory.assert_not_called()
     health_servicer_factory.assert_not_called()
     warmup_thread_factory.assert_not_called()
+
+
+def test_generation_warmup_sends_valid_sampling_defaults(monkeypatch, server_mod):
+    """Proto scalar defaults must not leak into SGLang sampling validation."""
+    complete = Mock()
+    complete.HasField.return_value = True
+    stub = Mock()
+    stub.GetModelInfo.return_value = pb.GetModelInfoResponse(is_generation=True)
+    stub.Generate.return_value = [complete]
+    channel = Mock()
+
+    monkeypatch.setattr(
+        server_mod.grpc,
+        "insecure_channel",
+        Mock(return_value=channel),
+        raising=False,
+    )
+    monkeypatch.setattr(server_mod, "sglang_scheduler_pb2", pb)
+    monkeypatch.setattr(
+        server_mod,
+        "sglang_scheduler_pb2_grpc",
+        SimpleNamespace(SglangSchedulerStub=lambda _channel: stub),
+    )
+    monkeypatch.setattr(
+        server_mod,
+        "DisaggregationMode",
+        SimpleNamespace(NULL=SimpleNamespace(value="null")),
+    )
+    monkeypatch.setattr(server_mod.time, "sleep", lambda _seconds: None)
+
+    server_args = SimpleNamespace(
+        host="127.0.0.1",
+        port=30000,
+        disaggregation_mode="null",
+    )
+    assert server_mod._execute_grpc_server_warmup(server_args) is True
+
+    params = stub.Generate.call_args.args[0].sampling_params
+    assert params.temperature == 0.0
+    assert params.top_p == 1.0
+    assert params.top_k == 1
+    assert params.repetition_penalty == 1.0
+    assert params.n == 1
+    assert params.max_new_tokens == 8
+    channel.close.assert_called_once()
 
 
 def test_server_waits_for_scheduler_shutdown(monkeypatch, server_mod):
@@ -420,3 +467,29 @@ def test_failed_startup_cleanup_runs_in_reverse_ownership_order(monkeypatch, ser
 
     assert events == ["health", "server", "schedulers", "manager"]
     terminate_scheduler_processes.assert_called_once_with(scheduler_procs)
+
+
+def test_request_tracing_initializes_after_the_runtime_context_is_published(
+    monkeypatch, server_mod
+):
+    """smg-lab#182: the Python servicer initializes SGLang's tracing in its
+    own process (as SGLang's HTTP frontend does) once the runtime context is
+    published and before anything else starts; the request manager then
+    starts each request's trace from the Router's context."""
+    events = []
+    monkeypatch.setattr(server_mod, "publish", lambda _args, role: events.append(f"publish:{role}"))
+
+    def init_tracing():
+        events.append("tracing")
+        return True
+
+    async def stop_here(**_kwargs):
+        events.append("launch")
+        raise RuntimeError("stop here")
+
+    monkeypatch.setattr(server_mod, "init_request_tracing", init_tracing)
+    monkeypatch.setattr(server_mod, "_launch_scheduler_with_request_manager", stop_here)
+    monkeypatch.delenv("SMG_SGLANG_SERVICER_IMPL", raising=False)
+    with pytest.raises(RuntimeError, match="stop here"):
+        asyncio.run(server_mod.serve_grpc(SimpleNamespace(disaggregation_mode="null")))
+    assert events == ["publish:tokenizer", "tracing", "launch"]

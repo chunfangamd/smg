@@ -22,7 +22,7 @@ use openai_protocol::{
 };
 use serde_json::Value;
 
-use crate::routers::grpc::utils;
+use crate::routers::grpc::{regular::stages::decisions::scoring::DecisionScoring, utils};
 
 /// Response-phase contract for one request, produced by request building.
 #[derive(Clone)]
@@ -34,8 +34,23 @@ pub(crate) enum ResponseSpec {
     /// Embedding/classify response processing needs only dispatch metadata.
     Embedding,
     Classify,
+    Decisions(DecisionsResponseSpec),
     Harmony(HarmonyResponseSpec),
     Transcription(TranscriptionResponseSpec),
+}
+
+#[derive(Clone)]
+pub(crate) struct DecisionsResponseSpec {
+    pub scoring: DecisionScoring,
+    pub questions: Vec<DecisionQuestionSpec>,
+    pub max_input_tokens: usize,
+}
+
+/// The candidate tokens and exact prompt size expected for one scoring RPC.
+#[derive(Clone)]
+pub(crate) struct DecisionQuestionSpec {
+    pub label_ids: Vec<u32>,
+    pub input_tokens: usize,
 }
 
 /// Wire format of a `/v1/audio/transcriptions` response body.
@@ -75,6 +90,8 @@ pub(crate) struct ChatResponseSpec {
     /// `n`, normalized.
     pub expected_choices: u32,
     pub logprobs: bool,
+    /// Alternatives per token the client asked for; none when absent.
+    pub top_logprobs: Option<u32>,
     pub stop: Option<StringOrArray>,
     pub stop_token_ids: Option<Vec<u32>>,
     pub no_stop_trim: bool,
@@ -83,6 +100,8 @@ pub(crate) struct ChatResponseSpec {
     pub skip_special_tokens: bool,
     /// Rendered prompt tokens the provider does not bill; set by request building.
     pub unbilled_prompt_tokens: u32,
+    /// Native channel formats can derive the initial state from the rendered prompt.
+    pub reasoning_in_prefill: Option<bool>,
 }
 
 impl From<&ChatCompletionRequest> for ChatResponseSpec {
@@ -110,12 +129,14 @@ impl From<&ChatCompletionRequest> for ChatResponseSpec {
             continues_final_assistant: utils::continues_final_assistant(request),
             expected_choices: request.n.unwrap_or(1).max(1),
             logprobs: request.logprobs,
+            top_logprobs: request.top_logprobs,
             stop: request.stop.clone(),
             stop_token_ids: request.stop_token_ids.clone(),
             no_stop_trim: request.no_stop_trim,
             ignore_eos: request.ignore_eos,
             skip_special_tokens: request.skip_special_tokens,
             unbilled_prompt_tokens: 0,
+            reasoning_in_prefill: None,
         }
     }
 }
@@ -124,6 +145,9 @@ impl ChatResponseSpec {
     /// Whether the reasoning parser starts in reasoning mode for this
     /// request (see [`utils::reasoning_starts_in_prefill`]).
     pub(crate) fn reasoning_starts_in_prefill(&self, tokenizer: &dyn Tokenizer) -> bool {
+        if let Some(in_prefill) = self.reasoning_in_prefill {
+            return in_prefill;
+        }
         utils::reasoning_starts_in_prefill(
             self.chat_template_kwargs.as_ref(),
             self.reasoning_effort.as_deref(),
@@ -158,6 +182,8 @@ impl From<&GenerateRequest> for GenerateResponseSpec {
 #[derive(Clone)]
 pub(crate) struct MessagesResponseSpec {
     pub thinking: Option<messages::ThinkingConfig>,
+    /// Native channel formats can derive the initial state from the rendered prompt.
+    pub reasoning_in_prefill: Option<bool>,
     pub tool_choice: Option<messages::ToolChoice>,
     pub has_tools: bool,
     pub history_tool_calls_count: usize,
@@ -170,6 +196,7 @@ impl From<&CreateMessageRequest> for MessagesResponseSpec {
     fn from(request: &CreateMessageRequest) -> Self {
         Self {
             thinking: request.thinking.clone(),
+            reasoning_in_prefill: None,
             tool_choice: request.tool_choice.clone(),
             has_tools: request.tools.is_some(),
             history_tool_calls_count: utils::message_utils::get_history_tool_calls_count_messages(
@@ -182,6 +209,23 @@ impl From<&CreateMessageRequest> for MessagesResponseSpec {
                 .unwrap_or_default(),
             stop_sequences: request.stop_sequences.clone(),
         }
+    }
+}
+
+impl MessagesResponseSpec {
+    pub(crate) fn reasoning_starts_in_prefill(&self, tokenizer: &dyn Tokenizer) -> bool {
+        if let Some(in_prefill) = self.reasoning_in_prefill {
+            return in_prefill;
+        }
+        let user_thinking = match &self.thinking {
+            Some(
+                messages::ThinkingConfig::Enabled { .. }
+                | messages::ThinkingConfig::Adaptive { .. },
+            ) => Some(true),
+            Some(messages::ThinkingConfig::Disabled) => Some(false),
+            None => None,
+        };
+        utils::should_mark_reasoning_started(user_thinking, tokenizer)
     }
 }
 
@@ -297,6 +341,34 @@ mod tests {
         let spec = ChatResponseSpec::from(&request);
 
         assert_eq!(tool_names(&spec), ["global", "dynamic_a", "dynamic_b"]);
+    }
+
+    #[test]
+    fn gemma4_rendered_prompt_state_overrides_the_thinking_preference() {
+        let request = chat_request(json!({
+            "model": "vllm-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "chat_template_kwargs": {"enable_thinking": true}
+        }));
+        let tokenizer = llm_tokenizer::MockTokenizer::new();
+        let mut spec = ChatResponseSpec::from(&request);
+        assert_eq!(spec.reasoning_in_prefill, None);
+        for in_prefill in [false, true] {
+            spec.reasoning_in_prefill = Some(in_prefill);
+            assert_eq!(spec.reasoning_starts_in_prefill(&tokenizer), in_prefill);
+        }
+
+        let request: CreateMessageRequest = serde_json::from_value(json!({
+            "model":"vllm-model", "max_tokens":16, "messages":[],
+            "thinking":{"type":"enabled", "budget_tokens":1024}
+        }))
+        .unwrap();
+        let mut spec = MessagesResponseSpec::from(&request);
+        assert_eq!(spec.reasoning_in_prefill, None);
+        for in_prefill in [false, true] {
+            spec.reasoning_in_prefill = Some(in_prefill);
+            assert_eq!(spec.reasoning_starts_in_prefill(&tokenizer), in_prefill);
+        }
     }
 
     #[test]

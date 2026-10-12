@@ -112,6 +112,7 @@ impl BuildStage for HarmonyRequestBuildingStage {
             | RequestType::Completion(_)
             | RequestType::Embedding(_)
             | RequestType::Classify(_)
+            | RequestType::Decisions(_)
             | RequestType::Messages(_)
             | RequestType::Transcription { .. }) => {
                 error!(
@@ -208,6 +209,9 @@ impl BuildStage for HarmonyRequestBuildingStage {
                 sampling_mask: None,
                 sampling_baseline: None,
                 inject_pd_metadata: self.inject_pd_metadata,
+                // Harmony's constraint is never shaped per worker; retries
+                // carry it as built.
+                tool_constraint: None,
             },
         })
     }
