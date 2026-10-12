@@ -149,6 +149,8 @@ jobs:
           python3 - <<'PY' >> "$GITHUB_OUTPUT"
           import json, os
           amd_runner = os.environ.get("AMD_RUNNER") or "8-gpu-mi325x"
+          # vLLM's ROCm image of the CI pin (scripts/ci_install_vllm.sh).
+          amd_image = "vllm/vllm-openai-rocm:v0.27.1"
           # max_model_len "auto": largest window that fits in GPU memory (capped at
           # native max). A fixed 32768 400'd on multi_turn_long_context (>32k prompts).
           #
@@ -252,10 +254,10 @@ jobs:
                "run_timeout": "7200",
                "model_cache": "/raid/models", "arm_mode": "concurrent", "max_model_len": "auto"},
               # AMD legs (MI325X, 256 GB per GPU): the H100 legs' models and parsers,
-              # each arm on one GPU (TP=1), both arms concurrent (GPU 0 + GPU 1). vLLM
-              # is the ROCm wheel of the same CI pin (scripts/ci_install_vllm_rocm.sh).
+              # each arm on one GPU (TP=1), both arms concurrent (GPU 0 + GPU 1), in
+              # vLLM's ROCm image of the same CI pin.
               {"name": "gpt-oss-amd", "runner": amd_runner, "vendor": "amd", "tp": 1,
-               "gpu_a": "0", "gpu_b": "1",
+               "image": amd_image, "gpu_a": "0", "gpu_b": "1",
                "model": "openai/gpt-oss-120b", "bfcl_model": "openai/gpt-oss-120b-FC",
                "vllm_tool": "openai", "vllm_reason": "",
                "smg_tool": "", "smg_reason": "",
@@ -263,7 +265,7 @@ jobs:
                "run_timeout": "7200",
                "model_cache": "/models", "arm_mode": "concurrent", "max_model_len": "auto"},
               {"name": "qwen3.8-amd", "runner": amd_runner, "vendor": "amd", "tp": 1,
-               "gpu_a": "0", "gpu_b": "1",
+               "image": amd_image, "gpu_a": "0", "gpu_b": "1",
                "model": "Qwen/Qwen3.8-27B", "bfcl_model": "Qwen/Qwen3.8-27B-FC",
                "vllm_tool": "qwen3_xml", "vllm_reason": "qwen3",
                "smg_tool": "qwen_xml", "smg_reason": "qwen3",
@@ -314,6 +316,9 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
     runs-on: ${{ matrix.runner }}
+    # The AMD legs run in their image, which brings its own ROCm, so the runner
+    # needs only Docker and the GPUs; the other legs run on the host.
+    container: ${{ matrix.vendor == 'amd' && fromJSON(format('{{"image":"{0}","options":"{1}"}}', matrix.image, vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN')) || '' }}
     # Generous: the nightly set adds multi_turn (state simulation), much slower
     # than the single-turn AST/live categories. The sequential deepseek-v4.1 leg needs
     # the most headroom — two whole-node arms (startup + scoring) run serially,
@@ -342,11 +347,9 @@ jobs:
       - name: Setup vLLM env (provides vllm + grpc servicer + smg)
         if: matrix.vendor != 'amd'
         uses: ./.github/actions/setup-vllm
-      - name: Setup vLLM env on ROCm (AMD legs)
+      - name: Setup vLLM env in its ROCm image (AMD legs)
         if: matrix.vendor == 'amd'
-        run: |
-          bash scripts/ci_setup_python_venv.sh
-          bash scripts/ci_install_vllm_rocm.sh
+        run: bash scripts/ci_setup_vllm_rocm_image.sh
       - name: Override vLLM with a per-commit main wheel (legs newer than the CI pin)
         # A leg whose model the pinned vLLM release (scripts/ci_install_vllm.sh)
         # cannot serve sets vllm_commit + vllm_version to a wheels.vllm.ai build.
