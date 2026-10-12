@@ -128,7 +128,7 @@ jobs:
         # architecture: mi30x for MI300X and MI325X, mi35x for MI355X.
         variant:
           - { id: sglang, runtime: sglang, image: "lmsysorg/sglang:v0.5.21-rocm10-mi30x", setup: ci_setup_sglang_rocm_image.sh }
-          - { id: vllm, runtime: vllm, image: "vllm/vllm-openai-rocm:v0.27.1", setup: ci_setup_vllm_rocm_image.sh }
+          - { id: vllm, runtime: vllm, image: "vllm/vllm-openai-rocm:v0.31.0", setup: ci_setup_vllm_rocm_image.sh }
 
     steps:
       - name: Check filters
@@ -238,7 +238,7 @@ jobs:
           - { id: Qwen/Qwen3-30B-A3B, slug: Qwen-Qwen3-30B-A3B, test_class: TestNightlyQwen30bMulti }
         variant:
           - { id: sglang, runtime: sglang, image: "lmsysorg/sglang:v0.5.21-rocm10-mi30x", setup: ci_setup_sglang_rocm_image.sh }
-          - { id: vllm, runtime: vllm, image: "vllm/vllm-openai-rocm:v0.27.1", setup: ci_setup_vllm_rocm_image.sh }
+          - { id: vllm, runtime: vllm, image: "vllm/vllm-openai-rocm:v0.31.0", setup: ci_setup_vllm_rocm_image.sh }
 
     steps:
       - name: Check filters
