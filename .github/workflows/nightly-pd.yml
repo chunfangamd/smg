@@ -167,7 +167,7 @@ jobs:
     with:
       engine: ${{ matrix.engine }}
       gpu_tier: "4"
-      runner: ${{ matrix.vendor == 'amd' && (vars.SMG_RUNNER_AMD_GPU_8 || '8-gpu-mi325x') || (vars.SMG_RUNNER_GPU_4 || '4-gpu-h100') }}
+      runner: ${{ matrix.vendor == 'amd' && (vars.SMG_RUNNER_AMD_GPU_8 || '8-gpu-mi300x') || (vars.SMG_RUNNER_GPU_4 || '4-gpu-h100') }}
       # The AMD rows run in vLLM's ROCm image, which ships NIXL, UCX and MoRI:
       # v0.31.0 rather than the CI's vLLM pin, as vLLM registers its KV cache
       # with MoRI-IO only from v0.29.0. The container gets the GPUs, the
