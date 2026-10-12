@@ -89,7 +89,7 @@ a GitHub Actions matrix — one leg per model, `fail-fast: false`, each on its o
   scheduled run skips these legs while the `blackwell` runner is offline (it has
   served no job since 2026-09-18); a `workflow_dispatch`, with or without `only`,
   still runs them.
-- `8-gpu-mi325x` (AMD Instinct MI325X; label overridable with the repo variable
+- `8-gpu-mi300x` (AMD Instinct MI300X; label overridable with the repo variable
   `SMG_RUNNER_AMD_GPU_8`) — `gpt-oss-amd` and `qwen3.8-amd`: the H100 legs'
   models and parsers, TP=1 per arm, both arms concurrent on GPUs 0 and 1. The
   legs run in vLLM's ROCm image of the same CI pin

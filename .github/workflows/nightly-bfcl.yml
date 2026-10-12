@@ -148,7 +148,7 @@ jobs:
           fi
           python3 - <<'PY' >> "$GITHUB_OUTPUT"
           import json, os
-          amd_runner = os.environ.get("AMD_RUNNER") or "8-gpu-mi325x"
+          amd_runner = os.environ.get("AMD_RUNNER") or "8-gpu-mi300x"
           # vLLM's ROCm image of the CI pin (scripts/ci_install_vllm.sh).
           amd_image = "vllm/vllm-openai-rocm:v0.27.1"
           # max_model_len "auto": largest window that fits in GPU memory (capped at
@@ -253,7 +253,7 @@ jobs:
                # arms serially); arms are concurrent here, so this is generous.
                "run_timeout": "7200",
                "model_cache": "/raid/models", "arm_mode": "concurrent", "max_model_len": "auto"},
-              # AMD legs (MI325X, 256 GB per GPU): the H100 legs' models and parsers,
+              # AMD legs (MI300X, 192 GB per GPU): the H100 legs' models and parsers,
               # each arm on one GPU (TP=1), both arms concurrent (GPU 0 + GPU 1), in
               # vLLM's ROCm image of the same CI pin.
               {"name": "gpt-oss-amd", "runner": amd_runner, "vendor": "amd", "tp": 1,
