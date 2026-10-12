@@ -150,7 +150,7 @@ jobs:
           import json, os
           amd_runner = os.environ.get("AMD_RUNNER") or "8-gpu-mi300x"
           # vLLM's ROCm image of the CI pin (scripts/ci_install_vllm.sh).
-          amd_image = "vllm/vllm-openai-rocm:v0.27.1"
+          amd_image = "vllm/vllm-openai-rocm:v0.31.0"
           # max_model_len "auto": largest window that fits in GPU memory (capped at
           # native max). A fixed 32768 400'd on multi_turn_long_context (>32k prompts).
           #

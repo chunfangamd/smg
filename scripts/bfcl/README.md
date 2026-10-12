@@ -93,7 +93,7 @@ a GitHub Actions matrix — one leg per model, `fail-fast: false`, each on its o
   `SMG_RUNNER_AMD_GPU_8`) — `gpt-oss-amd` and `qwen3.8-amd`: the H100 legs'
   models and parsers, TP=1 per arm, both arms concurrent on GPUs 0 and 1. The
   legs run in vLLM's ROCm image of the same CI pin
-  (`vllm/vllm-openai-rocm:v0.27.1`, set up by
+  (`vllm/vllm-openai-rocm:v0.31.0`, set up by
   `scripts/ci_setup_vllm_rocm_image.sh`), so an AMD leg and its H100 counterpart
   differ only in hardware, and the runner needs only Docker and the GPUs, not a
   particular ROCm release. These legs need an
