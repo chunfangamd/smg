@@ -127,8 +127,8 @@ jobs:
         # scripts/ci_install_vllm.sh). SGLang builds its ROCm images per GPU
         # architecture: mi30x for MI300X and MI325X, mi35x for MI355X.
         variant:
-          - { id: sglang, runtime: sglang, image: "lmsysorg/sglang:v0.5.21-rocm10-mi30x", setup: ci_setup_sglang_rocm_image.sh }
-          - { id: vllm, runtime: vllm, image: "vllm/vllm-openai-rocm:v0.31.0", setup: ci_setup_vllm_rocm_image.sh }
+          - { id: sglang, runtime: sglang, image: "lmsysorg/sglang:v0.5.21-rocm10-mi30x@sha256:4420a7e492fce623285c635b9a6a7e09ccf77a3c812006494e4414655d46662d", setup: ci_setup_sglang_rocm_image.sh }
+          - { id: vllm, runtime: vllm, image: "vllm/vllm-openai-rocm:v0.31.0@sha256:749f6f3f944f12af49966ac523c1f8573e4b229594b541954bd5f879b4496b1f", setup: ci_setup_vllm_rocm_image.sh }
 
     steps:
       - name: Check filters
@@ -238,8 +238,8 @@ jobs:
           - { id: meta-llama/Llama-3.1-8B-Instruct, slug: meta-llama-Llama-3.1-8B-Instruct, test_class: TestNightlyLlama8bMulti }
           - { id: Qwen/Qwen3-30B-A3B, slug: Qwen-Qwen3-30B-A3B, test_class: TestNightlyQwen30bMulti }
         variant:
-          - { id: sglang, runtime: sglang, image: "lmsysorg/sglang:v0.5.21-rocm10-mi30x", setup: ci_setup_sglang_rocm_image.sh }
-          - { id: vllm, runtime: vllm, image: "vllm/vllm-openai-rocm:v0.31.0", setup: ci_setup_vllm_rocm_image.sh }
+          - { id: sglang, runtime: sglang, image: "lmsysorg/sglang:v0.5.21-rocm10-mi30x@sha256:4420a7e492fce623285c635b9a6a7e09ccf77a3c812006494e4414655d46662d", setup: ci_setup_sglang_rocm_image.sh }
+          - { id: vllm, runtime: vllm, image: "vllm/vllm-openai-rocm:v0.31.0@sha256:749f6f3f944f12af49966ac523c1f8573e4b229594b541954bd5f879b4496b1f", setup: ci_setup_vllm_rocm_image.sh }
 
     steps:
       - name: Check filters
