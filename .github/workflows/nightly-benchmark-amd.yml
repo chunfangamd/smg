@@ -133,9 +133,10 @@ jobs:
     steps:
       - name: Check filters
         id: filter
+        env:
+          MODELS: ${{ github.event.inputs.models || 'all' }}
+          RUNTIME: ${{ github.event.inputs.runtime || 'all' }}
         run: |
-          MODELS="${{ github.event.inputs.models || 'all' }}"
-          RUNTIME="${{ github.event.inputs.runtime || 'all' }}"
           SKIP="false"
           if [ "$MODELS" != "all" ] && ! echo ",$MODELS," | grep -Fq ",${{ matrix.model.id }},"; then
             SKIP="true"
@@ -243,9 +244,10 @@ jobs:
     steps:
       - name: Check filters
         id: filter
+        env:
+          MODELS: ${{ github.event.inputs.models || 'all' }}
+          RUNTIME: ${{ github.event.inputs.runtime || 'all' }}
         run: |
-          MODELS="${{ github.event.inputs.models || 'all' }}"
-          RUNTIME="${{ github.event.inputs.runtime || 'all' }}"
           SKIP="false"
           if [ "$MODELS" != "all" ] && ! echo ",$MODELS," | grep -Fq ",${{ matrix.model.id }},"; then
             SKIP="true"
