@@ -177,11 +177,13 @@ jobs:
 
       # The image has no Docker to run genai-bench's image, so genai-bench
       # comes from PyPI, at that image's version, in a venv of its own.
+      # truststore 0.10.5 breaks TLS in a process gevent has patched, as
+      # genai-bench's locust does, so it is held below that.
       - name: Install genai-bench
         if: steps.filter.outputs.skip != 'true'
         run: |
           python3 -m venv "$RUNNER_TEMP/genai-bench"
-          bash scripts/ci_retry.sh 3 10 "$RUNNER_TEMP/genai-bench/bin/pip" install "genai-bench==${GENAI_BENCH_IMAGE##*:}"
+          bash scripts/ci_retry.sh 3 10 "$RUNNER_TEMP/genai-bench/bin/pip" install "genai-bench==${GENAI_BENCH_IMAGE##*:}" "truststore<0.10.5"
           echo "GENAI_BENCH_BIN=$RUNNER_TEMP/genai-bench/bin/genai-bench" >> "$GITHUB_ENV"
 
       - name: Run benchmark
@@ -290,7 +292,7 @@ jobs:
         if: steps.filter.outputs.skip != 'true'
         run: |
           python3 -m venv "$RUNNER_TEMP/genai-bench"
-          bash scripts/ci_retry.sh 3 10 "$RUNNER_TEMP/genai-bench/bin/pip" install "genai-bench==${GENAI_BENCH_IMAGE##*:}"
+          bash scripts/ci_retry.sh 3 10 "$RUNNER_TEMP/genai-bench/bin/pip" install "genai-bench==${GENAI_BENCH_IMAGE##*:}" "truststore<0.10.5"
           echo "GENAI_BENCH_BIN=$RUNNER_TEMP/genai-bench/bin/genai-bench" >> "$GITHUB_ENV"
 
       - name: Run benchmark
