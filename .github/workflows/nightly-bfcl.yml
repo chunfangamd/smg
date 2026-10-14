@@ -321,6 +321,11 @@ jobs:
     # The AMD legs run in their image, which brings its own ROCm, so the runner
     # needs only Docker and the GPUs; the other legs run on the host.
     container: ${{ matrix.vendor == 'amd' && fromJSON(format('{{"image":"{0}","options":"{1}"}}', matrix.image, vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN')) || '' }}
+    # In a container, steps default to sh (dash in the vLLM image); they are
+    # written for bash, which the legs on the host get as `bash -e {0}`.
+    defaults:
+      run:
+        shell: bash -e {0}
     # Generous: the nightly set adds multi_turn (state simulation), much slower
     # than the single-turn AST/live categories. The sequential deepseek-v4.1 leg needs
     # the most headroom — two whole-node arms (startup + scoring) run serially,
