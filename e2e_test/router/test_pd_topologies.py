@@ -391,16 +391,21 @@ def _launched_transport(worker) -> str:
     return f"moriio-{vllm_moriio_mode()}" if backend == "moriio" else backend
 
 
-def _metric_total(text: str, name: str, **labels: str) -> float:
-    """Sum of a Prometheus metric's samples that carry ``labels``."""
-    total = 0.0
+def _metric_samples(text: str, name: str, **labels: str) -> list[float]:
+    """Values of a Prometheus metric's samples that carry ``labels``."""
+    samples = []
     for line in text.splitlines():
         rest = line[len(name) :] if line.startswith(name) else None
         if rest is None or (rest and rest[0] not in " {"):
             continue  # another metric, or a longer name with this prefix
         if all(f'{k}="{v}"' in rest for k, v in labels.items()):
-            total += float(line.rsplit(" ", 1)[1])
-    return total
+            samples.append(float(line.rsplit(" ", 1)[1]))
+    return samples
+
+
+def _metric_total(text: str, name: str, **labels: str) -> float:
+    """Sum of a Prometheus metric's samples that carry ``labels``."""
+    return sum(_metric_samples(text, name, **labels))
 
 
 def _engine_metric(workers, name: str, **labels: str) -> float:
@@ -626,9 +631,17 @@ class TestPDTopology:
 
     @staticmethod
     def _decode_computed(gateway: Gateway) -> float:
-        return _engine_metric(
-            gateway.decode_workers, "vllm:prompt_tokens_by_source_total", source="local_compute"
-        )
+        """Prompt tokens the decode workers computed themselves. vLLM exports the
+        series from start-up, so a worker without it fails the test instead of
+        reading as zero."""
+        name = "vllm:prompt_tokens_by_source_total"
+        total = 0.0
+        for worker in gateway.decode_workers:
+            text = httpx.get(f"{worker.http_url}/metrics", timeout=5.0).text
+            samples = _metric_samples(text, name, source="local_compute")
+            assert samples, f'{worker.base_url} exports no {name}{{source="local_compute"}}'
+            total += sum(samples)
+        return total
 
     def test_second_turn_sees_the_first(self, setup_backend):
         _, model, client, gateway = setup_backend

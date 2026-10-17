@@ -133,7 +133,7 @@ on:
 jobs:
   run:
     runs-on: ${{ inputs.runner }}
-    container: ${{ inputs.container_image != '' && fromJSON(format('{{"image":"{0}","options":"{1}"}}', inputs.container_image, inputs.container_options)) || vars.SMG_CI_GPU_CONTAINER_IMAGE }}
+    container: ${{ inputs.container_image != '' && fromJSON(format('{{"image":{0},"options":{1}}}', toJSON(inputs.container_image), toJSON(inputs.container_options))) || vars.SMG_CI_GPU_CONTAINER_IMAGE }}
     timeout-minutes: ${{ inputs.timeout }}
     permissions:
       contents: read
