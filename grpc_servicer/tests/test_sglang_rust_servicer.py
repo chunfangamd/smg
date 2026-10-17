@@ -297,6 +297,14 @@ def test_server_facts_carry_the_router_labels_and_the_window(monkeypatch):
     # Without --limit-mm-data-per-request the engine has no per-request media
     # limit to advertise: the Router keeps its own caps.
     assert "mm_item_limits" not in args
+    # A newer engine resolves --dp-size 8 --enable-dp-attention into
+    # attn_dp_size=8, dp_size=1: eight schedulers dial, as on the pinned release.
+    rewritten = rust.server_facts(
+        _server_args(dp_size=1, attn_dp_size=8, enable_dp_attention=False)
+    )
+    assert rewritten["data_parallel_size"] == 8
+    groups = rust.server_facts(_server_args(dp_size=2, attn_dp_size=4, enable_dp_attention=False))
+    assert groups["data_parallel_size"] == 8
 
 
 def test_server_facts_carry_the_engines_media_limits_flat(monkeypatch):
@@ -319,17 +327,17 @@ def test_server_facts_carry_where_the_engine_starts_a_grammar(monkeypatch):
         rust.server_facts(_server_args(reasoning_parser="qwen3"))["server_args_json"]
     )
     assert gated["engine_reasoning_parser"] == "qwen3"
-    assert gated["structured_outputs_start"] == "after_reasoning"
+    assert gated["constrained_decoding_start"] == "after_reasoning"
     # The engine's own argument stays under its own name; the Router's label
     # readers never take it as the per-model parser override.
     assert gated["reasoning_parser"] == "qwen3"
 
     plain = json.loads(rust.server_facts(_server_args(reasoning_parser=None))["server_args_json"])
-    assert plain["structured_outputs_start"] == "first_token"
+    assert plain["constrained_decoding_start"] == "first_token"
     assert "engine_reasoning_parser" not in plain
 
     older = json.loads(rust.server_facts(_server_args())["server_args_json"])
-    assert "structured_outputs_start" not in older and "engine_reasoning_parser" not in older
+    assert "constrained_decoding_start" not in older and "engine_reasoning_parser" not in older
 
 
 def test_server_facts_carry_the_kv_events_publisher(monkeypatch):
@@ -666,7 +674,7 @@ def test_serve_rust_starts_the_scheduler_ranks_from_this_process(
         supervised["server"], supervised["engine"] = server, engine
         return 0
 
-    monkeypatch.setattr(rust, "supervise", fake_supervise)
+    monkeypatch.setattr(rust_lifecycle, "supervise", fake_supervise)
     args = _preparable_args(recorded)
 
     assert asyncio.run(rust.serve_rust(args)) == 0
@@ -708,7 +716,7 @@ def test_serve_rust_wires_the_server_the_scheduler_and_the_supervisor(monkeypatc
         assert isinstance(server, FakeServer) and engine == "engine"
         return 7
 
-    monkeypatch.setattr(rust, "supervise", fake_supervise)
+    monkeypatch.setattr(rust_lifecycle, "supervise", fake_supervise)
     args = _server_args()
     assert asyncio.run(rust.serve_rust(args)) == 7
     assert created["bind_address"] == "127.0.0.1:30011"
@@ -751,7 +759,7 @@ def _run_serve_rust(monkeypatch, tmp_path, *, real_facts: bool = False) -> dict:
     async def fake_supervise(server, engine, *, drain_secs, **_kwargs):
         return 0
 
-    monkeypatch.setattr(rust, "supervise", fake_supervise)
+    monkeypatch.setattr(rust_lifecycle, "supervise", fake_supervise)
     assert asyncio.run(rust.serve_rust(_server_args())) == 0
     return created
 
@@ -878,3 +886,108 @@ def test_the_spawn_start_method_is_forced_when_the_engines_setup_left_it_unset(
     rust.launch_scheduler_ranks(_preparable_args(recorded), handshake_port=24321)
 
     assert recorded["start_method_calls"] == [("spawn", True)]
+
+
+# ── the knobs are validated before the bind (smg-lab #292) ─────────────────────
+
+
+@pytest.mark.parametrize(
+    "name, value, text",
+    [
+        ("SMG_SGLANG_SERVICER_DRAIN_SECS", "abc", "is not a number"),
+        ("SMG_SGLANG_SERVICER_DRAIN_SECS", "-5", "must be at least 0"),
+        ("SMG_SGLANG_SERVICER_STARTUP_TIMEOUT_SECS", "abc", "is not a number"),
+        ("SMG_SGLANG_SERVICER_STARTUP_TIMEOUT_SECS", "-1", "must be greater than 0"),
+        ("SMG_SGLANG_SERVICER_HANDSHAKE_PORT", "70000", "must be between 1 and 65535"),
+        ("SMG_SGLANG_SERVICER_HANDSHAKE_PORT", "abc", "is not a port number"),
+    ],
+)
+def test_serve_rust_refuses_a_bad_knob_before_the_server_binds(
+    monkeypatch, tmp_path, name, value, text
+):
+    """smg-lab #292: every knob is read and validated first; a value the
+    servicer cannot use is a named error before any engine work, before the
+    server is constructed (and so before the port is bound), and before the
+    scheduler ranks start. The drain was read only once the engine ran."""
+    created: dict = {}
+
+    class FakeServer:
+        def __init__(self, **kwargs):
+            created.update(kwargs)
+
+    _install_fake_servicer(monkeypatch, FakeServer)
+
+    def no_engine_work(*_args, **_kwargs):
+        raise AssertionError("no engine work before the knobs are validated")
+
+    monkeypatch.setattr(rust, "model_facts", no_engine_work)
+    monkeypatch.setattr(rust, "server_facts", no_engine_work)
+    monkeypatch.setattr(rust, "launch_scheduler_ranks", no_engine_work)
+    monkeypatch.setenv("SMG_ZMQ_SOCKET_DIR", str(tmp_path))
+    monkeypatch.setenv(name, value)
+
+    with pytest.raises(rust_lifecycle.ServicerConfigError, match=f"{name}='{value}' {text}"):
+        asyncio.run(rust.serve_rust(_server_args()))
+    assert created == {}
+
+
+def test_serve_rust_refuses_a_socket_dir_that_is_a_file_before_the_server_binds(
+    monkeypatch, tmp_path
+):
+    created: dict = {}
+
+    class FakeServer:
+        def __init__(self, **kwargs):
+            created.update(kwargs)
+
+    _install_fake_servicer(monkeypatch, FakeServer)
+    a_file = tmp_path / "a-file"
+    a_file.write_text("not a directory")
+    monkeypatch.setenv("SMG_ZMQ_SOCKET_DIR", str(a_file))
+
+    with pytest.raises(rust_lifecycle.ServicerConfigError, match="SMG_ZMQ_SOCKET_DIR=.*not a dir"):
+        asyncio.run(rust.serve_rust(_server_args()))
+    assert created == {}
+
+
+def test_a_disaggregated_worker_is_refused_as_a_configuration_error():
+    with pytest.raises(rust_lifecycle.ServicerConfigError, match="PD disaggregation"):
+        rust.refuse_disaggregation(_server_args(disaggregation_mode="prefill"))
+
+
+def test_a_launch_that_fails_stops_the_already_bound_server(monkeypatch, tmp_path):
+    """The server owns the port and a runtime thread: a scheduler launch that
+    raises must not leave them to the process exit (what the vLLM launcher
+    does), and nothing is supervised."""
+    events: list[str] = []
+
+    class FakeServer:
+        def __init__(self, **kwargs):
+            self.address = kwargs["bind_address"]
+
+        def set_serving(self, serving: bool) -> None:
+            events.append(f"serving:{serving}")
+
+        def stop(self, timeout: float) -> None:
+            events.append(f"stop:{timeout}")
+
+    _install_fake_servicer(monkeypatch, FakeServer)
+    monkeypatch.setenv(rust.HANDSHAKE_PORT_ENV, "24321")
+    monkeypatch.setenv("SMG_ZMQ_SOCKET_DIR", str(tmp_path))
+    monkeypatch.setattr(rust, "model_facts", lambda args: {"model_path": args.model_path})
+    monkeypatch.setattr(
+        rust, "server_facts", lambda args: {"data_parallel_size": 1, "sglang_version": "x"}
+    )
+    monkeypatch.setattr(rust, "tokenizer_dir_for", lambda args: "/tok")
+
+    def failing_launch(server_args, *, handshake_port):
+        raise RuntimeError("scheduler would not start")
+
+    async def never_supervise(*_args, **_kwargs):
+        pytest.fail("a failed launch was supervised")
+
+    monkeypatch.setattr(rust, "launch_scheduler_ranks", failing_launch)
+    monkeypatch.setattr(rust_lifecycle, "supervise", never_supervise)
+    with pytest.raises(RuntimeError, match="scheduler would not start"):
+        asyncio.run(rust.serve_rust(_server_args()))
+    assert events == ["serving:False", "stop:5.0"]

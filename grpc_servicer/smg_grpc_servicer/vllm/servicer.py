@@ -33,10 +33,11 @@ from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import RequestOutputKind, StructuredOutputsParams
 
 from smg_grpc_servicer.kv_relay import Engine, relay
-from smg_grpc_servicer.tokenizer_bundle import CHUNK_SIZE, build_tokenizer_zip
+from smg_grpc_servicer.tokenizer_bundle import build_tokenizer_zip, tokenizer_chunks
 from smg_grpc_servicer.trace_context import trace_headers
 from smg_grpc_servicer.vllm import attach_vllm_logging
 from smg_grpc_servicer.vllm.admin import flush_cache
+from smg_grpc_servicer.vllm.config_view import EngineConfigView, uses_mrope
 from smg_grpc_servicer.vllm.errors import grpc_code_for
 from smg_grpc_servicer.vllm.kv_events import (
     rank_sources_for,
@@ -68,13 +69,13 @@ from smg_grpc_servicer.vllm.mm_salt import (
 )
 from smg_grpc_servicer.vllm.mm_tensors import tensor_from_proto
 from smg_grpc_servicer.vllm.model_info import (
+    constrained_decoding_start,
     engine_reasoning_parser,
     mm_device_do_normalize,
     mm_item_limits,
     model_facts,
     running_window,
     server_facts,
-    structured_outputs_start,
 )
 
 from .mm_keys import (
@@ -107,11 +108,9 @@ def _prompt_length(prompt) -> int:
 
 def _kv_capacity_tokens(engine) -> int:
     """The KV cache's token capacity, when the engine config exposes it."""
-    cache = getattr(getattr(engine, "vllm_config", None), "cache_config", None)
-    blocks = getattr(cache, "num_gpu_blocks", None)
-    block_size = getattr(cache, "block_size", None)
-    if isinstance(blocks, int) and isinstance(block_size, int) and blocks > 0 and block_size > 0:
-        return blocks * block_size
+    cache = EngineConfigView(getattr(engine, "vllm_config", None)).cache
+    if cache.num_gpu_blocks is not None and cache.block_size is not None:
+        return cache.num_gpu_blocks * cache.block_size
     return 0
 
 
@@ -132,9 +131,7 @@ def _first_rank(engine) -> int:
         ranks = [rank for rank in managed if isinstance(rank, int)]
         if ranks:
             return min(ranks)
-    parallel = getattr(getattr(engine, "vllm_config", None), "parallel_config", None)
-    start = getattr(parallel, "data_parallel_rank", 0)
-    return start if isinstance(start, int) and start > 0 else 0
+    return EngineConfigView(getattr(engine, "vllm_config", None)).parallel.data_parallel_rank
 
 
 def _latest_scheduler_stats(engine, engine_idx: int = 0):
@@ -429,8 +426,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                     cache_salt = mm_identity_cache_salt(mm_identity_hashes(batches))
                     if cache_salt is not None:
                         prompt["cache_salt"] = cache_salt
-                    model_config = getattr(self.engine, "model_config", None)
-                    if model_config is not None and getattr(model_config, "uses_mrope", False):
+                    if uses_mrope(getattr(self.engine, "model_config", None)):
                         logger.warning(
                             "Request %s carries mm identity but no grid tensors on an "
                             "M-RoPE model; decode-side positions will be text-only",
@@ -766,9 +762,9 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         # The engine's reasoning parser and where it starts a grammar on a
         # thinking prompt, for the Router to shape a forced tool call's
         # grammar by; likewise absent from an older package.
-        if "structured_outputs_start" in info.DESCRIPTOR.fields_by_name:
+        if "constrained_decoding_start" in info.DESCRIPTOR.fields_by_name:
             info.engine_reasoning_parser = engine_reasoning_parser(self.engine.vllm_config)
-            info.structured_outputs_start = structured_outputs_start(self.engine.vllm_config)
+            info.constrained_decoding_start = constrained_decoding_start(self.engine.vllm_config)
         return info
 
     async def GetLoads(
@@ -848,28 +844,25 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         estimate on the first rank only, as the Rust servicer stamps its
         batches. A rank whose snapshot the servicer cannot read gets no
         record rather than another rank's figures; the first rank reports
-        zeros before its first snapshot, as ``GetLoads`` does."""
-        try:
-            first_rank = _first_rank(self.engine)
-            rank = first_rank if dp_rank is None else dp_rank
-            counts = self._scheduler_counts(rank)
-            if counts is None:
-                if rank != first_rank:
-                    return None
-                counts = (0, 0, 0.0)
-            num_running, num_waiting, kv_usage = counts
-            return load_record(
-                num_running,
-                num_waiting,
-                kv_usage,
-                self._loads.estimate(num_waiting) if rank == first_rank else None,
-                dp_rank=rank,
-                max_total_num_tokens=_kv_capacity_tokens(self.engine),
-                max_running_requests=_max_running_requests(self.engine),
-            )
-        except Exception:  # noqa: BLE001 - a record that cannot be read leaves the batch without one
-            logger.debug("load record unavailable", exc_info=True)
-            return None
+        zeros before its first snapshot, as ``GetLoads`` does. A read that
+        raises is the recorder's to report."""
+        first_rank = _first_rank(self.engine)
+        rank = first_rank if dp_rank is None else dp_rank
+        counts = self._scheduler_counts(rank)
+        if counts is None:
+            if rank != first_rank:
+                return None
+            counts = (0, 0, 0.0)
+        num_running, num_waiting, kv_usage = counts
+        return load_record(
+            num_running,
+            num_waiting,
+            kv_usage,
+            self._loads.estimate(num_waiting) if rank == first_rank else None,
+            dp_rank=rank,
+            max_total_num_tokens=_kv_capacity_tokens(self.engine),
+            max_running_requests=_max_running_requests(self.engine),
+        )
 
     async def GetTokenizer(
         self,
@@ -912,17 +905,8 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             sha256,
         )
 
-        # Stream chunks; SHA-256 only on the final chunk
-        offset = 0
-        total = len(zip_data)
-        while offset < total:
-            end = min(offset + CHUNK_SIZE, total)
-            is_last = end == total
-            yield common_pb2.GetTokenizerChunk(
-                data=bytes(zip_data[offset:end]),
-                sha256=sha256 if is_last else "",
-            )
-            offset = end
+        for chunk in tokenizer_chunks(zip_data, sha256):
+            yield chunk
 
     # ========== Helper methods ==========
 

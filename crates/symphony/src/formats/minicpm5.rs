@@ -1,18 +1,7 @@
 //! MiniCPM5: reasoning between `<think>` and `</think>`, each call between `<function name="…">`
 //! and `</function>` as `<param name="…">` tags whose key is the attribute and whose value the
-//! request's tools type, everything else content. There is no block around the calls: the
-//! template writes the turn as `<think>\n`, the reasoning, `\n</think>\n\n`, the content, a
-//! newline when there is content, then the calls one after another with a newline between them,
-//! each `<function name="NAME">`, its parameters with nothing between the tags, `</function>`. A
-//! value that holds `<`, `&` or a newline is a CDATA section, `<![CDATA[…]]>`, which the assembler
-//! unwraps ([`tagged::attributed`](crate::tagged::attributed)); every other value is written as
-//! Python prints it (`True`, `['a', 'b']`), which the typed reader takes. The thought is the
-//! model's to write: the generation prompt is `<|im_start|>assistant\n` alone unless the request
-//! sets `enable_thinking`, when the template opens the thought (`<think>\n`) or closes it empty
-//! (`<think>\n\n</think>\n\n`), as Qwen3's does; the newlines around the thought and before the
-//! calls reach the reasoning and content streams (bellwether #17's question). A turn opens with
-//! `<|im_start|>assistant`, so the prompt's replay starts there. Recorded as `minicpm5-2b`
-//! (openbmb/MiniCPM5-2B), 54,181 parse cases, 15,432 of them with calls:
+//! request's tools type, everything else content, and no block around the calls. Recorded as
+//! `minicpm5-2b` (openbmb/MiniCPM5-2B), 54,181 parse cases, 15,432 of them with calls:
 //!
 //! ```text
 //! <think>
@@ -23,9 +12,7 @@
 //! <function name="play"><param name="artist">Maroon 5</param><param name="n">15</param></function>
 //! ```
 //!
-//! A forced call's structural tag is each call as a tag its opener triggers, the parameter tags
-//! with nothing between them ([`grammar`](crate::grammar)).
-
+//! Notes on this table, and on what it leaves open: `docs/tables.md`.
 use crate::{
     format::{CallSyntax, Emits, Format},
     tagged::attributed,
@@ -205,8 +192,9 @@ mod tests {
         let events = run(PROMPT, &[OUTPUT]);
         assert_eq!(bytes(&events), OUTPUT);
         assert_eq!(reasoning(&events), "\nThe user wants two songs.\n");
-        // The newlines around the thought and the one before the calls are the model's.
-        assert_eq!(content(&events), "\n\nTwo songs, then.\n\n");
+        // The newlines around the thought and the one after the content are the model's; the
+        // one between the calls is the template's spacing, dropped.
+        assert_eq!(content(&events), "\n\nTwo songs, then.\n");
         assert_eq!(
             arguments_of(&events, 0),
             r#"{"artist": "Taylor Swift", "duration": 20}"#
@@ -279,9 +267,10 @@ mod tests {
         ];
         let events = run(PROMPT, &pieces);
         assert_eq!(bytes(&events), pieces.concat());
-        // An empty thought is the newline after `<think>` and the one before `</think>`.
+        // An empty thought is the newline after `<think>` and the one before `</think>`; the two
+        // between the thought and the call are the template's spacing, not content.
         assert_eq!(reasoning(&events), "\n\n");
-        assert_eq!(content(&events), "\n\n");
+        assert_eq!(content(&events), "");
         assert_eq!(arguments_of(&events, 0), r#"{"artist": "Taylor Swift"}"#);
         // The string streams as its pieces arrive: three fragments and the closing quote.
         let fragments: Vec<&str> = events

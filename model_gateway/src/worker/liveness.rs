@@ -63,7 +63,15 @@
 //!   configured threshold or, if longer, the time the engine may still need
 //!   to prefill what is in flight ([`Worker::prefill_backlog`]): a batch that
 //!   is all in prefill streams nothing and is not wedged. A zero threshold
-//!   turns the rule off.
+//!   turns the rule off. The same bound, read per request, caps how long a
+//!   disaggregated prefill leg may stay silent ([`prefill_leg_bound`]): a
+//!   leg is not part of any pile, so its request is what fails, over to
+//!   another prefill worker when one is available. A leg past its bound is
+//!   given up on only while its worker has answered nothing within the
+//!   bound ([`prefill_leg_reprieve`]): a worker that keeps answering other
+//!   legs is backed up (on the parallel dispatch shape a leg's first
+//!   response also waits for the decode side), not frozen, and its leg
+//!   waits on.
 //!
 //! - **stale records** (an unreachable veto by another rule): a worker whose
 //!   KV-event stream has pushed load records is heard from every few
@@ -119,9 +127,72 @@ const WEDGE_BOUND_CAP: Duration = Duration::from_secs(120);
 /// the engine may still need before the first token of its in-flight prompts
 /// is due, whichever is longer.
 fn wedge_bound(worker: &Arc<dyn Worker>, wedge: Duration) -> Duration {
-    wedge
-        .max(worker.prefill_backlog())
-        .min(wedge.max(WEDGE_BOUND_CAP))
+    bound_over(wedge, worker.prefill_backlog())
+}
+
+/// The wedge rule's bound over an `eta` the engine may still need: the
+/// configured threshold or the ETA, whichever is longer, capped.
+fn bound_over(wedge: Duration, eta: Duration) -> Duration {
+    wedge.max(eta).min(wedge.max(WEDGE_BOUND_CAP))
+}
+
+/// How long a disaggregated prefill leg of `prompt_tokens` dispatched to
+/// `worker` now may produce nothing before its request gives up on it: the
+/// wedge rule's bound, with the leg's own prompt behind what the worker is
+/// already prefilling ([`Worker::prefill_eta`]), so a long prompt on a busy
+/// worker gets the time its measured rate says it needs, a short one the
+/// configured threshold, and nothing more than the cap. A PD leg joins no
+/// pile and is never vetoed by one; the request is what the bound ends.
+/// `None` when the rule is off (a zero threshold).
+pub(crate) fn prefill_leg_bound(worker: &Arc<dyn Worker>, prompt_tokens: u64) -> Option<Duration> {
+    let (_, wedge, _) = thresholds();
+    prefill_leg_bound_with(worker, prompt_tokens, wedge)
+}
+
+/// [`prefill_leg_bound`] at the given wedge threshold.
+fn prefill_leg_bound_with(
+    worker: &Arc<dyn Worker>,
+    prompt_tokens: u64,
+    wedge: Duration,
+) -> Option<Duration> {
+    (!wedge.is_zero()).then(|| bound_over(wedge, worker.prefill_eta(prompt_tokens)))
+}
+
+/// How long a sequential disaggregated decode leg of `prompt_tokens`
+/// dispatched now may produce nothing before its request gives up on it:
+/// the prefill leg's bound for the same prompt on `prefills`, the worker
+/// whose prefill of the prompt stands before the leg's first token
+/// ([`prefill_leg_bound`]): the prefill worker when the leg was handed its
+/// KV (the handoff moves what that prefill produced), the decode worker when
+/// it recomputes the prompt itself (no handoff: a fan-out, or a prefill that
+/// returned no transfer parameters). The configured threshold for a short
+/// prompt, the time the worker's measured prefill rate says a long prompt
+/// takes, and nothing more than the cap. The leg was admitted to a room on
+/// its decode worker before its dispatch. `None` when the rule is off (a
+/// zero threshold).
+pub(crate) fn decode_leg_bound(prefills: &Arc<dyn Worker>, prompt_tokens: u64) -> Option<Duration> {
+    prefill_leg_bound(prefills, prompt_tokens)
+}
+
+/// Whether a prefill leg past its own bound waits on, and how much longer.
+/// A leg is given up on only when its worker is silent as a whole, with no
+/// first response on any prompt within the bound, as the pile rule judges
+/// a worker by its pile and not by one request. A worker that answered
+/// another leg a moment ago is backed up, not frozen (on the parallel
+/// dispatch shape a leg's first response also waits for the decode side to
+/// admit it), so the leg waits until a bound has passed since that answer.
+/// `None` when the worker has answered nothing within the bound, or ever:
+/// the verdict.
+pub(crate) fn prefill_leg_reprieve(worker: &Arc<dyn Worker>, bound: Duration) -> Option<Duration> {
+    reprieve(worker.prefill_answered_ago(), bound)
+}
+
+/// [`prefill_leg_reprieve`] for a worker whose latest first response was
+/// `answered_ago` (`None`: never).
+fn reprieve(answered_ago: Option<Duration>, bound: Duration) -> Option<Duration> {
+    bound
+        .checked_sub(answered_ago?)
+        .filter(|left| !left.is_zero())
 }
 
 static THRESHOLDS: OnceLock<(Duration, Duration, Duration)> = OnceLock::new();
@@ -229,11 +300,24 @@ pub(crate) fn now_ms() -> u64 {
     u64::try_from(EPOCH.get_or_init(Instant::now).elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
-/// Whether a gRPC status describes the connection rather than the request:
-/// what a dead peer, a reset or a failed keepalive produce. A deadline or an
+/// Whether a gRPC status code is one the connection produces rather than
+/// the request: what a dead peer, a reset, a failed keepalive or an engine
+/// that says it is unavailable end a stream with. A deadline or an
 /// engine-side error says the worker is slow or wrong, not gone, and a slow
 /// worker that still streams tokens must not flap in and out of routing.
-pub(crate) fn is_transport_failure(code: tonic::Code) -> bool {
+///
+/// The code alone decides, because the question is whether the peer is
+/// reachable for work, and every way of being unreachable ends the
+/// monitors' polls and streams with one of these codes; which layer
+/// produced the status does not matter here. The gRPC client's
+/// [`smg_grpc_client::is_transport_failure`] asks a different question of a
+/// status under a call, whether it is the HTTP/2 layer's doing rather than
+/// the worker's answer, and reads the status's source chain because the
+/// code cannot tell those apart. The two are not interchangeable: an
+/// `Unavailable` the worker answered with is a connection code here and no
+/// transport failure there; an `Internal` made of a protocol fault is a
+/// transport failure there and no connection code here.
+pub(crate) fn is_connection_code(code: tonic::Code) -> bool {
     matches!(
         code,
         tonic::Code::Unavailable
@@ -617,6 +701,7 @@ fn set(worker: &Arc<dyn Worker>, reason: Option<StallReason>, cause: &'static st
 mod tests {
     use std::thread;
 
+    use smg_grpc_client::{h2, is_transport_failure};
     use tokio::sync::mpsc;
 
     use super::*;
@@ -626,6 +711,106 @@ mod tests {
 
     fn worker() -> Arc<dyn Worker> {
         Arc::new(BasicWorkerBuilder::new("http://w1:8000").build())
+    }
+
+    /// The expectation the three callers share, for every gRPC code: the
+    /// load poll, the KV subscription and the KV stream all mark a worker
+    /// as contact failed when their call or stream ends with a connection
+    /// code, and leave it alone on any other code. Four codes are the
+    /// connection's; the rest describe the request. A `match` with no
+    /// wildcard arm: a code added to tonic is a build error here until it
+    /// has its row.
+    fn expectation(code: tonic::Code) -> (bool, &'static str) {
+        use tonic::Code;
+        match code {
+            Code::Ok => (false, "a clean end is not a failure"),
+            Code::Cancelled => (true, "a reset stream: the peer or the link went away"),
+            Code::Unknown => (
+                true,
+                "an error with no gRPC code: a closed or broken connection",
+            ),
+            Code::InvalidArgument => (false, "the request was wrong, the worker is there"),
+            Code::DeadlineExceeded => (false, "our own deadline: slow, not gone"),
+            Code::NotFound => (false, "the request's"),
+            Code::AlreadyExists => (false, "the request's"),
+            Code::PermissionDenied => (false, "the request's"),
+            Code::ResourceExhausted => (false, "the worker's capacity pushback: busy, not gone"),
+            Code::FailedPrecondition => (false, "the request's"),
+            Code::Aborted => (true, "the worker aborted the stream under us"),
+            Code::OutOfRange => (
+                false,
+                "the KV subscription resyncs on it before asking; never a contact failure",
+            ),
+            Code::Unimplemented => (false, "the request's"),
+            Code::Internal => (
+                false,
+                "the worker's own failure on a request: wrong, not gone",
+            ),
+            Code::Unavailable => (
+                true,
+                "a dead peer, a refused stream or a worker that says it is unavailable",
+            ),
+            Code::DataLoss => (
+                false,
+                "the KV stream resyncs on it before asking; never a contact failure",
+            ),
+            Code::Unauthenticated => (false, "the request's"),
+        }
+    }
+
+    /// Every gRPC code against the callers' expectation. The codes come
+    /// from tonic's own numbering: `from_i32` answers `Unknown` for a
+    /// number tonic has no code for, so the numbers must map back to
+    /// themselves (each a real code, once) and the 17th must not.
+    #[test]
+    fn a_connection_code_is_one_of_four_and_every_other_code_is_the_requests() {
+        use tonic::Code;
+        let codes: Vec<Code> = (0..=16).map(Code::from_i32).collect();
+        assert_eq!(
+            codes
+                .iter()
+                .map(|&code| i32::from(code))
+                .collect::<Vec<_>>(),
+            (0..=16).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            Code::from_i32(17),
+            Code::Unknown,
+            "tonic numbers a 17th code: give it a row"
+        );
+        for &code in &codes {
+            let (expected, why) = expectation(code);
+            assert_eq!(is_connection_code(code), expected, "{code:?}: {why}");
+        }
+        assert_eq!(codes.iter().filter(|&&code| expectation(code).0).count(), 4);
+    }
+
+    /// The gRPC client's `is_transport_failure` answers another question
+    /// (is this status the HTTP/2 layer's doing rather than the worker's
+    /// answer?) from the status's source chain, and the two disagree by
+    /// design in both directions.
+    #[test]
+    fn a_connection_code_and_a_transport_failure_are_different_questions() {
+        // An Unavailable the worker answered with: unreachable for work, yet
+        // not the transport's doing.
+        let answered = tonic::Status::unavailable("shutting down");
+        assert!(is_connection_code(answered.code()));
+        assert!(!is_transport_failure(&answered));
+
+        // An Internal tonic made of a protocol fault: the transport's doing,
+        // yet its code is the one a worker's own failure carries.
+        let fault =
+            tonic::Status::from_error(Box::new(h2::Error::from(h2::Reason::PROTOCOL_ERROR)));
+        assert_eq!(fault.code(), tonic::Code::Internal);
+        assert!(is_transport_failure(&fault));
+        assert!(!is_connection_code(fault.code()));
+
+        // A refused stream is both: an Unavailable with an HTTP/2 cause.
+        let refused =
+            tonic::Status::from_error(Box::new(h2::Error::from(h2::Reason::REFUSED_STREAM)));
+        assert_eq!(refused.code(), tonic::Code::Unavailable);
+        assert!(is_transport_failure(&refused));
+        assert!(is_connection_code(refused.code()));
     }
 
     #[test]
@@ -759,6 +944,82 @@ mod tests {
         assert!(wedged_by_queue(8, 8, 8, silent, bound), "standing queue");
         assert!(wedged_by_pile(8, 8, silent, bound), "deep pile");
         assert!(!wedged_by_pile(8, 8, Duration::from_millis(2_900), bound));
+    }
+
+    #[test]
+    fn a_prefill_legs_bound_follows_its_prompt_the_workers_rate_and_the_cap() {
+        // A disaggregated prefill leg is bounded like the pile rule bounds a
+        // worker: the threshold for a short prompt on an idle worker, the
+        // prefill time its prompt needs behind what is already pending at
+        // the worker's rate (the cold prior of 10k tokens/s until one is
+        // measured), never more than the cap.
+        let w = worker();
+        assert_eq!(
+            prefill_leg_bound_with(&w, 256, DEFAULT_WEDGE),
+            Some(DEFAULT_WEDGE),
+            "26 ms of prefill is inside the threshold"
+        );
+        assert_eq!(
+            prefill_leg_bound_with(&w, 32_768, DEFAULT_WEDGE),
+            Some(Duration::from_millis(3_276)),
+            "a 32k prompt on a cold worker"
+        );
+        w.note_prefill_started(8 * 32_768, true);
+        assert_eq!(
+            prefill_leg_bound_with(&w, 32_768, DEFAULT_WEDGE),
+            Some(Duration::from_millis(29_491)),
+            "behind eight pending 32k prompts"
+        );
+        w.note_prefill_ended(8 * 32_768, true, Some(0));
+        assert_eq!(
+            prefill_leg_bound_with(&w, 100_000_000, DEFAULT_WEDGE),
+            Some(WEDGE_BOUND_CAP),
+            "capped"
+        );
+        assert_eq!(
+            prefill_leg_bound_with(&w, 100_000_000, Duration::from_secs(600)),
+            Some(Duration::from_secs(600)),
+            "a longer configured threshold stands"
+        );
+        assert_eq!(
+            prefill_leg_bound_with(&w, 32_768, Duration::ZERO),
+            None,
+            "a zero threshold turns the bound off"
+        );
+    }
+
+    #[test]
+    fn a_prefill_leg_past_its_bound_waits_on_while_its_worker_answers_other_legs() {
+        // The verdict is on the worker, not the leg: a worker that has
+        // answered nothing (ever, or within the bound) is silent and the leg
+        // is given up on; one that answered another leg a moment ago is
+        // backed up, and the leg waits until a bound has passed since that
+        // answer.
+        let bound = DEFAULT_WEDGE;
+        assert_eq!(reprieve(None, bound), None, "never answered: silent");
+        assert_eq!(
+            reprieve(Some(Duration::from_millis(600)), bound),
+            Some(Duration::from_millis(2_400)),
+            "answered 0.6 s ago: the leg waits the rest of a bound"
+        );
+        assert_eq!(
+            reprieve(Some(bound), bound),
+            None,
+            "a bound has passed since the latest answer"
+        );
+        assert_eq!(reprieve(Some(Duration::from_secs(10)), bound), None);
+        let w = worker();
+        assert_eq!(
+            prefill_leg_reprieve(&w, bound),
+            None,
+            "a fresh worker has answered nothing"
+        );
+        w.note_prefill_started(256, true);
+        w.note_prefill_ended(256, true, Some(0));
+        assert!(
+            prefill_leg_reprieve(&w, bound).is_some_and(|left| left > Duration::from_secs(2)),
+            "answered just now: a bound's reprieve, less the moment since"
+        );
     }
 
     #[test]

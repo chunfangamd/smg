@@ -123,6 +123,22 @@ impl Assembler {
     }
 }
 
+impl crate::engine::CallAssembler for Assembler {
+    fn feed(&mut self, text: &str, _declared: &crate::tagged::Declared, out: &mut Events) -> usize {
+        self.feed(text, out)
+    }
+
+    /// The message's closing terminal is the region's: the object closed the call at its brace.
+    fn close(self: Box<Self>, _terminal: &str, out: &mut Events) -> bool {
+        (*self).close(out);
+        false
+    }
+
+    fn finish(self: Box<Self>, out: &mut Events) {
+        (*self).finish(out);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -170,6 +186,23 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn an_object_without_its_arguments_member_is_a_call_with_an_empty_object() {
+        // The object's assembler says `{}` for a call whose object lacks the member, here `args`,
+        // whole and byte by byte.
+        let call = "get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\"}";
+        let per_char: Vec<&str> = call
+            .char_indices()
+            .map(|(i, c)| &call[i..i + c.len_utf8()])
+            .collect();
+        for (events, taken) in [run(&[call], false), run(&per_char, false)] {
+            assert_eq!(taken, call.len());
+            assert_eq!(bytes(&events), call);
+            assert_eq!(arguments(&events), "{}");
+            assert!(matches!(events.last(), Some(Event::ToolCallEnd { .. })));
+        }
     }
 
     #[test]
