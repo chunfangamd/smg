@@ -12,18 +12,19 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use anyhow::Context;
 use llm_multimodal::{
-    configure_parallelism, registry::modality_limit_override, vision::PreProcessorConfig,
-    FrameSampling, MediaConnector, MediaConnectorConfig, MediaConnectorError, MediaContentPart,
-    MediaFault, Modality, ModelMetadata, ModelRegistry, MultiModalError, Parallelism,
-    VisionProcessorRegistry, POOL_THREADS_ENV,
+    configure_parallelism, data_url::data_url_payload_bytes, registry::modality_limit_override,
+    vision::PreProcessorConfig, FrameSampling, MediaConnector, MediaConnectorConfig,
+    MediaConnectorError, MediaContentPart, MediaFault, Modality, ModelMetadata, ModelRegistry,
+    MultiModalError, Parallelism, TransparencyPolicy, VisionProcessorRegistry, POOL_THREADS_ENV,
 };
 use llm_tokenizer::TokenizerTrait;
 use openai_protocol::worker::MmProcessingMode;
 use smg_grpc_client::{vllm_proto as vllm, WorkerMediaFault};
-use tracing::warn;
+use tracing::{info, warn};
 
 use super::{
     assemble::{assemble_vllm_batches_with, VllmAssembly},
+    capability::runtime_reads_format,
     config::{MultimodalComponents, MultimodalConfigRegistry, MultimodalModelConfig},
     mm_settings,
     pixel_cache::pixel_cache_with_budget,
@@ -31,7 +32,10 @@ use super::{
     process::process_multimodal_plan,
     RegistryTokenizer,
 };
-use crate::{routers::grpc::proto_wrapper::vllm_mm_identity, worker::http_client::build_client};
+use crate::{
+    routers::grpc::proto_wrapper::vllm_mm_identity,
+    worker::{http_client::build_with, RuntimeType},
+};
 
 /// A worker serves one model: the config registry's one key.
 const CONFIG_KEY: &str = "worker";
@@ -391,6 +395,12 @@ impl WorkerMediaPipeline {
                     &model_registry.spec_names()
                 ))
             })?;
+            anyhow::ensure!(
+                runtime_reads_format(RuntimeType::Vllm, spec.encoder_input_format()),
+                "the {} spec preprocesses media into a format vLLM does not read; serve this \
+                 model's media with --mm-processor inprocess",
+                spec.name()
+            );
             let limits = spec.modality_limits(&metadata).map_err(|error| {
                 anyhow::anyhow!("reading the {} spec's media limits: {error}", spec.name())
             })?;
@@ -424,21 +434,32 @@ impl WorkerMediaPipeline {
                  --mm-device-do-normalize=false or use --mm-processor inprocess"
             );
         }
-        let client = build_client(
+        // The worker fetches the client-supplied media URLs the router
+        // forwards: the engine's own allow-list bounds the hosts by name, and
+        // the address policy refuses private origins unless the worker's
+        // environment allows them (a worker has no flags of its own).
+        let connector_config = MediaConnectorConfig {
+            allowed_domains: settings.allowed_domains.clone(),
+            allow_private_hosts: mm_settings().allow_private_media_hosts.value,
+            allowed_local_media_path: None,
+            fetch_timeout: settings.fetch_timeout,
+            video_fetch_timeout: settings.video_fetch_timeout,
+        };
+        // The line shows the allow-list as the connector enforces it (trimmed,
+        // a list with no names being none), not as it was spelled.
+        info!(
+            allowed_media_domains =
+                ?llm_multimodal::effective_allowed_domains(connector_config.allowed_domains.as_deref()),
+            allow_private_media_hosts = connector_config.allow_private_hosts,
+            "media fetch policy for worker-side processing"
+        );
+        let connector = build_with(
             || crate::http_client::client_builder().timeout(Duration::from_secs(30)),
             false,
             "media HTTP client",
+            |client| MediaConnector::new(client, connector_config.clone()),
         )
-        .map_err(anyhow::Error::msg)?;
-        let connector = MediaConnector::new(
-            client,
-            MediaConnectorConfig {
-                allowed_domains: settings.allowed_domains.clone(),
-                allowed_local_media_path: None,
-                fetch_timeout: settings.fetch_timeout,
-                video_fetch_timeout: settings.video_fetch_timeout,
-            },
-        )
+        .map_err(anyhow::Error::msg)
         .context("building the media connector")?;
         let components = MultimodalComponents {
             media_connector: Arc::new(connector),
@@ -538,11 +559,16 @@ impl WorkerMediaPipeline {
             CONFIG_KEY,
             &self.model_dir,
             &HashMap::new(),
+            |format| runtime_reads_format(RuntimeType::Vllm, format),
         )
         .await
         .map_err(|error| WorkerMediaError::Invalid(format!("{error:#}")))?;
         validate_rendered_media_anchors(&plan, &placeholders, tokenizer, &prompt_token_ids)
             .map_err(|error| WorkerMediaError::Invalid(format!("{error:#}")))?;
+        // This pipeline runs inside the engine whose batches it assembles
+        // (`VllmAssembly`), so its frames decode under that engine's own
+        // transparency rule, the white composite of its image loader; a
+        // processor that keeps alpha overrides it inside the plan.
         let output = process_multimodal_plan(
             plan,
             &self.model_id,
@@ -551,6 +577,8 @@ impl WorkerMediaPipeline {
             &self.components,
             CONFIG_KEY,
             &self.model_dir,
+            self.assembly.image_wire_dtype(),
+            TransparencyPolicy::CompositeOverWhite,
         )
         .await
         .map_err(classify)?;
@@ -574,7 +602,11 @@ impl WorkerMediaPipeline {
 
     /// The content part for one item, with the checks the Python servicer
     /// makes before fetching: a scheme this worker fetches, an inline payload
-    /// under the cap, a modality the pipeline takes.
+    /// under the cap, a modality the pipeline takes. The cap's message names
+    /// the worker as the flag's owner: the router relays the refusal in its
+    /// 400, and its own per-item input bound (`SMG_*_MAX_INPUT_BYTES`, 256 MiB
+    /// by default) is checked earlier with a message of its own, so a reader
+    /// of either knows which launcher to set.
     fn part(
         &self,
         index: usize,
@@ -594,7 +626,7 @@ impl WorkerMediaPipeline {
             if size > cap {
                 return Err(WorkerMediaError::Invalid(format!(
                     "media_refs[{index}]: inline payload is {size} bytes, above the {cap}-byte cap \
-                     (--mm-max-item-bytes)"
+                     (the worker's --mm-max-item-bytes)"
                 )));
             }
         }
@@ -617,19 +649,6 @@ impl WorkerMediaPipeline {
                 )))
             }
         })
-    }
-}
-
-/// The decoded size of a `data:` URL's payload, as the Python servicer
-/// estimates it (`data_url_payload_bytes`); `None` for any other URL.
-fn data_url_payload_bytes(url: &str) -> Option<usize> {
-    let rest = url.strip_prefix("data:")?;
-    let (header, payload) = rest.split_once(',')?;
-    if header.to_ascii_lowercase().contains(";base64") {
-        let trimmed = payload.trim_end_matches('=');
-        Some(trimmed.len() * 3 / 4)
-    } else {
-        Some(payload.len())
     }
 }
 
@@ -858,17 +877,81 @@ mod tests {
         std::fs::remove_dir(dir).unwrap();
     }
 
+    /// The inline payload cap sizes a `data:` URL by the shared rule: the
+    /// scheme's case does not matter, so an uppercase scheme cannot slip a
+    /// payload past `--mm-max-item-bytes` that the router and the servicer
+    /// refuse; the refusal names the worker as the flag's owner.
+    #[tokio::test]
+    async fn pipeline_caps_an_inline_payload_whatever_the_scheme_case() {
+        let dir = std::env::temp_dir().join(format!(
+            "smg-worker-media-item-bytes-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = dir.join("config.json");
+        std::fs::write(
+            &config,
+            r#"{"model_type": "llava", "image_token_index": 32000}"#,
+        )
+        .unwrap();
+        let settings = WorkerMediaSettings {
+            model_dir: dir.display().to_string(),
+            served_model_name: None,
+            model_id: dir.display().to_string(),
+            pixel_format: PixelFormat::Normalized,
+            encoder_dtype: "float32".to_string(),
+            processor_kwargs: serde_json::Map::new(),
+            max_items: None,
+            engine_item_limits: HashMap::new(),
+            max_item_bytes: Some(4),
+            allowed_domains: None,
+            fetch_timeout: Duration::from_secs(1),
+            video_fetch_timeout: Duration::from_secs(1),
+            video_frame_budget: None,
+            video_loader_rule: None,
+        };
+        let pipeline = WorkerMediaPipeline::new(settings, Arc::new(MockTokenizer::new()))
+            .await
+            .unwrap();
+
+        for url in [
+            "data:image/png;base64,AAAAAAAA",
+            "DATA:image/png;base64,AAAAAAAA",
+        ] {
+            let items = vec![WorkerMediaItem {
+                modality: Modality::Image,
+                url: url.to_string(),
+            }];
+            let error = pipeline
+                .process(vec![1, 2, 3], &items, false)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(
+                    &error,
+                    WorkerMediaError::Invalid(message)
+                        if message.contains("inline payload is 6 bytes")
+                            && message.contains("(the worker's --mm-max-item-bytes)")
+                ),
+                "{url}: {error}"
+            );
+        }
+        std::fs::remove_file(config).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
     #[test]
     fn data_url_payload_size_is_estimated_like_the_python_servicer() {
+        // The shared estimator counts base64 padding, as the servicer does.
         assert_eq!(
             data_url_payload_bytes("data:image/png;base64,AAAA"),
             Some(3)
         );
         assert_eq!(
             data_url_payload_bytes("data:image/png;base64,AAA="),
-            Some(2)
+            Some(3)
         );
-        assert_eq!(data_url_payload_bytes("data:text/plain,hello"), Some(5));
+        assert_eq!(data_url_payload_bytes("DATA:text/plain,hello"), Some(5));
         assert_eq!(data_url_payload_bytes("https://example.com/x.png"), None);
     }
 
@@ -980,6 +1063,42 @@ mod unsupported_model_tests {
     use llm_tokenizer::MockTokenizer;
 
     use super::*;
+
+    /// A spec whose encoder inputs vLLM does not read never preprocesses for
+    /// this vLLM worker: the pipeline refuses to start.
+    #[tokio::test]
+    async fn a_spec_vllm_cannot_read_is_refused_at_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"model_type": "NemotronH_Nano_Omni_Reasoning_V3"}"#,
+        )
+        .unwrap();
+        let path = dir.path().to_str().unwrap().to_string();
+        let settings = WorkerMediaSettings {
+            model_dir: path.clone(),
+            model_id: path,
+            served_model_name: None,
+            pixel_format: PixelFormat::Normalized,
+            encoder_dtype: "bfloat16".to_string(),
+            processor_kwargs: serde_json::Map::new(),
+            max_items: None,
+            engine_item_limits: HashMap::new(),
+            max_item_bytes: None,
+            allowed_domains: None,
+            fetch_timeout: Duration::from_secs(1),
+            video_fetch_timeout: Duration::from_secs(1),
+            video_frame_budget: None,
+            video_loader_rule: None,
+        };
+        let error = WorkerMediaPipeline::new(settings, Arc::new(MockTokenizer::default()))
+            .await
+            .err()
+            .expect("a spec vLLM cannot read");
+        let message = format!("{error:#}");
+        assert!(message.contains("format vLLM does not read"), "{message}");
+        assert!(message.contains("--mm-processor inprocess"), "{message}");
+    }
 
     /// A family without a spec is refused in the terms an operator acts on:
     /// the model type and architectures, the served name, the families the

@@ -14,11 +14,12 @@
 //! and quotes included, nothing escaped; a number, `true`, `false` and `null` bare; a list between
 //! `[` and `]` and an object between `{` and `}`, their members joined by `,` with no space and
 //! keys bare at every depth; the keys in sorted order (the template's `dictsort`), whatever order
-//! the request gave them.
+//! the request gave them. FunctionGemma writes the same shape with `<escape>` around a string and
+//! `None` for a null: the table names its [`Spelling`], and the assembler reads by it.
 //!
 //! The assembler writes the arguments as JSON while they arrive: each key quoted, `": "` after it
 //! and `", "` between members, as the engines' parsers spell them; a string's text escaped as JSON
-//! requires and streamed as it comes; a bare value as it is. The `<|"|>` token may be cut by a
+//! requires and streamed as it comes; a bare value as it is. The string token may be cut by a
 //! piece's end, so a trailing start of it is held until the next bytes say. Every byte lands in one
 //! event: the `call:NAME{` header is the start's source, each fragment's bytes its own, the closing
 //! marker the end's. Text after the object closed and before the marker, which the template never
@@ -31,8 +32,30 @@ use crate::{
     tagged::assembler::{push_escaped, push_quoted},
 };
 
-/// The token around a string's text.
-pub const STRING: &str = "<|\"|>";
+/// How a template spells the syntax: the token around a string's text, and the word for a null
+/// value. Gemma 4 writes `<|"|>` and `null`, FunctionGemma `<escape>` and `None`; `true` and
+/// `false` are the same in both.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Spelling {
+    /// The token around a string's text.
+    pub string: &'static str,
+    /// The word for a null value.
+    pub null: &'static str,
+}
+
+impl Spelling {
+    /// Gemma 4's: `<|"|>` around a string, `null`.
+    pub const GEMMA4: Self = Self {
+        string: "<|\"|>",
+        null: "null",
+    };
+    /// FunctionGemma's: `<escape>` around a string, `None` (Python's word for the value, where
+    /// `true` and `false` keep JSON's).
+    pub const FUNCTION_GEMMA: Self = Self {
+        string: "<escape>",
+        null: "None",
+    };
+}
 /// The call's header up to the tool's name.
 const HEADER: &str = "call:";
 const NOT_A_CALL: &str = "a call that does not start with `call:NAME{`";
@@ -47,13 +70,15 @@ pub struct Assembler {
     index: u32,
     id: String,
     /// Bytes read into no event yet: the header before its `{`, a key before its `:`, a bare value
-    /// before its end, or a trailing start of `<|"|>`.
+    /// before its end, or a trailing start of the string token.
     carried: String,
     stage: Stage,
     /// The open containers, innermost last, each with whether a member has been written in it.
     containers: Vec<Container>,
     started: bool,
     done: bool,
+    /// The template's string token and null word.
+    spelling: Spelling,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,7 +89,7 @@ enum Stage {
     Key,
     /// Where a value or an empty list's close stands.
     Value,
-    /// Inside a string: the text up to the next `<|"|>`.
+    /// Inside a string: the text up to the next string token.
     Text,
     /// Where `,` or the container's close stands.
     AfterValue,
@@ -80,8 +105,8 @@ struct Container {
 
 impl Assembler {
     /// An assembler for the call at `index` with the id the format minted for it, positioned just
-    /// after `<|tool_call>`.
-    pub fn new(index: u32, id: impl Into<String>) -> Self {
+    /// after the call's opening marker, reading by `spelling`.
+    pub fn new(index: u32, id: impl Into<String>, spelling: Spelling) -> Self {
         Self {
             index,
             id: id.into(),
@@ -90,6 +115,7 @@ impl Assembler {
             containers: Vec::new(),
             started: false,
             done: false,
+            spelling,
         }
     }
 
@@ -108,6 +134,7 @@ impl Assembler {
         text.push_str(bytes);
         let mut rest = text.as_str();
         while !rest.is_empty() {
+            let stage = self.stage;
             let taken = match self.stage {
                 Stage::Header => self.header(rest, out),
                 Stage::Key => self.key(rest, out),
@@ -116,9 +143,10 @@ impl Assembler {
                 Stage::AfterValue => self.after_value(rest, out),
                 Stage::Closed => after_the_object(rest, out),
             };
-            if taken == 0 {
+            if taken == 0 && self.stage == stage {
                 // What is left is held: a header, key or bare value still arriving, or a start of
-                // `<|"|>`.
+                // the string token. A reader that moved on without taking a byte (an empty value
+                // before a comma) has the next one read the same bytes.
                 self.carried.push_str(rest);
                 return;
             }
@@ -223,10 +251,15 @@ impl Assembler {
         };
         let key = rest[space..colon].trim_end();
         if key.is_empty() {
+            // The colon is reported; the member keeps its place with an empty key, so that the
+            // value that follows it stays inside a valid object.
             out.push(Event::Malformed {
                 text: Text::uncounted(&rest[..=colon]),
                 why: MalformedReason::Other(EMPTY_KEY.to_string()),
             });
+            let mut json = self.separator();
+            json.push_str("\"\": ");
+            self.push_fragment(json, Text::default(), out);
         } else {
             let mut json = self.separator();
             push_quoted(&mut json, key);
@@ -246,10 +279,11 @@ impl Assembler {
         }
         let after = &rest[space..];
         let first = after.chars().next().unwrap_or_default();
-        let string = after.starts_with(STRING);
-        // Nothing is taken until the value's start is whole: a start of `<|"|>` still arriving, or
-        // a bare literal whose end has not come, is held.
-        if (!string && STRING.starts_with(after))
+        let token = self.spelling.string;
+        let string = after.starts_with(token);
+        // Nothing is taken until the value's start is whole: a start of the string token still
+        // arriving, or a bare literal whose end has not come, is held.
+        if (!string && token.starts_with(after))
             || (!string && !matches!(first, '{' | '[' | ']') && !after.contains([',', '}', ']']))
         {
             return 0;
@@ -262,9 +296,9 @@ impl Assembler {
         };
         if string {
             let json = format!("{separator}\"");
-            self.push_fragment(json, Text::uncounted(&rest[..space + STRING.len()]), out);
+            self.push_fragment(json, Text::uncounted(&rest[..space + token.len()]), out);
             self.stage = Stage::Text;
-            return space + STRING.len();
+            return space + token.len();
         }
         match first {
             '{' | '[' => {
@@ -289,7 +323,7 @@ impl Assembler {
                 let end = after.find([',', '}', ']']).unwrap_or(after.len());
                 let literal = after[..end].trim_end();
                 let mut json = separator;
-                push_bare(&mut json, literal);
+                push_bare(&mut json, literal, self.spelling.null);
                 self.push_fragment(json, Text::uncounted(&rest[..space + end]), out);
                 self.stage = Stage::AfterValue;
                 space + end
@@ -300,20 +334,21 @@ impl Assembler {
     /// A string's text up to its closing token, streamed as it arrives; a trailing start of the
     /// token is held.
     fn text(&mut self, rest: &str, out: &mut Events) -> usize {
-        if let Some(at) = rest.find(STRING) {
+        let token = self.spelling.string;
+        if let Some(at) = rest.find(token) {
             let mut json = String::with_capacity(at + 1);
             push_escaped(&mut json, &rest[..at]);
             json.push('"');
-            self.push_fragment(json, Text::uncounted(&rest[..at + STRING.len()]), out);
+            self.push_fragment(json, Text::uncounted(&rest[..at + token.len()]), out);
             self.stage = Stage::AfterValue;
-            return at + STRING.len();
+            return at + token.len();
         }
-        let keep = (1..STRING.len())
+        let keep = (1..token.len())
             .rev()
             .find(|&n| {
                 rest.len() >= n
                     && rest.is_char_boundary(rest.len() - n)
-                    && STRING.starts_with(&rest[rest.len() - n..])
+                    && token.starts_with(&rest[rest.len() - n..])
             })
             .unwrap_or(0);
         let give = &rest[..rest.len() - keep];
@@ -344,18 +379,24 @@ impl Assembler {
             }
             '}' | ']' => self.close_container(&rest[..=space], out),
             _ => {
-                // The template writes a separator or a close here; anything else is reported and
-                // read as the next value's start.
-                out.push(Event::Malformed {
-                    text: Text::uncounted(&rest[..space]),
-                    why: MalformedReason::Other(VALUE_CUT_SHORT.to_string()),
-                });
-                self.stage = if self.in_list() {
-                    Stage::Value
+                // The template writes a separator or a close here; anything else is the next
+                // member's start, read as such from its first byte, with the whitespace before
+                // it reported.
+                if space > 0 {
+                    out.push(Event::Malformed {
+                        text: Text::uncounted(&rest[..space]),
+                        why: MalformedReason::Other(VALUE_CUT_SHORT.to_string()),
+                    });
+                }
+                let next = &rest[space..];
+                let taken = if self.in_list() {
+                    self.stage = Stage::Value;
+                    self.value(next, out)
                 } else {
-                    Stage::Key
+                    self.stage = Stage::Key;
+                    self.key(next, out)
                 };
-                return space.max(1);
+                return space + taken;
             }
         }
         space + 1
@@ -453,25 +494,36 @@ impl Assembler {
     }
 }
 
-/// Text after the arguments closed: whitespace is dropped, anything else reported.
-fn after_the_object(rest: &str, out: &mut Events) -> usize {
-    if rest.trim().is_empty() {
-        out.push(Event::Dropped {
-            text: Text::uncounted(rest),
-            why: DropReason::Wrapper,
+/// Text after the arguments closed, run by run: whitespace is dropped as the template's wrapping,
+/// anything else reported, so the events are the same however the bytes are cut.
+fn after_the_object(text: &str, out: &mut Events) -> usize {
+    let mut rest = text;
+    while let Some(first) = rest.chars().next() {
+        let space = first.is_whitespace();
+        let length = rest
+            .char_indices()
+            .find(|(_, c)| c.is_whitespace() != space)
+            .map_or(rest.len(), |(i, _)| i);
+        out.push(if space {
+            Event::Dropped {
+                text: Text::uncounted(&rest[..length]),
+                why: DropReason::Wrapper,
+            }
+        } else {
+            Event::Malformed {
+                text: Text::uncounted(&rest[..length]),
+                why: MalformedReason::Other(TEXT_AFTER_THE_OBJECT.to_string()),
+            }
         });
-    } else {
-        out.push(Event::Malformed {
-            text: Text::uncounted(rest),
-            why: MalformedReason::Other(TEXT_AFTER_THE_OBJECT.to_string()),
-        });
+        rest = &rest[length..];
     }
-    rest.len()
+    text.len()
 }
 
-/// A bare value as JSON: a number, `true`, `false` or `null` as it is; any other bare text, which
-/// the template never writes, as a JSON string, so the arguments stay an object a client can read.
-fn push_bare(json: &mut String, literal: &str) {
+/// A bare value as JSON: a number, `true` or `false` as it is, the spelling's null word as `null`;
+/// any other bare text, which the template never writes, as a JSON string, so the arguments stay
+/// an object a client can read.
+fn push_bare(json: &mut String, literal: &str, null: &str) {
     let is_number = literal
         .strip_prefix('-')
         .unwrap_or(literal)
@@ -479,10 +531,29 @@ fn push_bare(json: &mut String, literal: &str) {
         .next()
         .is_some_and(|c| c.is_ascii_digit())
         && serde_json::from_str::<serde_json::Value>(literal).is_ok();
-    if is_number || matches!(literal, "true" | "false" | "null") {
+    if is_number || matches!(literal, "true" | "false") {
         json.push_str(literal);
+    } else if literal == null {
+        json.push_str("null");
     } else {
         push_quoted(json, literal);
+    }
+}
+
+impl crate::engine::CallAssembler for Assembler {
+    fn feed(&mut self, text: &str, _declared: &crate::tagged::Declared, out: &mut Events) -> usize {
+        self.feed(text, out);
+        text.len()
+    }
+
+    /// Gemma 4's closing marker is the call's own, carried by its end.
+    fn close(self: Box<Self>, terminal: &str, out: &mut Events) -> bool {
+        (*self).close(terminal, out);
+        true
+    }
+
+    fn finish(self: Box<Self>, out: &mut Events) {
+        (*self).finish(out);
     }
 }
 
@@ -493,7 +564,7 @@ mod tests {
     const CLOSE: &str = "<tool_call|>";
 
     fn run(pieces: &[&str], cut: bool) -> Vec<Event> {
-        let mut assembler = Assembler::new(0, "call_0");
+        let mut assembler = Assembler::new(0, "call_0", Spelling::GEMMA4);
         let mut out = Events::new();
         for piece in pieces {
             assembler.feed(piece, &mut out);
@@ -547,6 +618,97 @@ mod tests {
         "call:get_weather{city:<|\"|>Paris, \"la\" ville\n<|\"|>,days:3,metric:true,",
         "options:{tags:[<|\"|>a<|\"|>,<|\"|>b<|\"|>],none:null,ratio:-0.5},empty:[]}"
     );
+
+    #[test]
+    fn a_member_that_follows_a_value_without_a_separator_keeps_its_first_byte() {
+        // A value followed by the next member where a comma should be: the member is read from
+        // its first byte, so every byte of the output lands in an event, whole and in pieces,
+        // and the arguments stay a valid object; an empty key keeps its member's place as `""`.
+        let cases = [
+            (
+                "call:f{a:<|\"|>x<|\"|>coconut<|\"|>,b:1}",
+                r#"{"a": "x", "coconut<|\"|>,b": 1}"#,
+            ),
+            ("call:f{a:<|\"|>x<|\"|>  coconut}", r#"{"a": "x"}"#),
+            ("call:f{a:<|\"|>x<|\"|>:2}", r#"{"a": "x", "": 2}"#),
+            ("call:f{:2}", r#"{"": 2}"#),
+            ("call:f{a:[<|\"|>x<|\"|>y]}", r#"{"a": ["x", "y"]}"#),
+        ];
+        for (text, expected) in cases {
+            let whole = run(&[text], false);
+            assert_eq!(bytes(&whole), format!("{text}{CLOSE}"), "{text:?}: whole");
+            assert_eq!(arguments(&whole), expected, "{text:?}");
+            assert!(
+                serde_json::from_str::<serde_json::Value>(&arguments(&whole)).is_ok(),
+                "{text:?}: a valid object"
+            );
+            let per_char: Vec<&str> = text
+                .char_indices()
+                .map(|(i, c)| &text[i..i + c.len_utf8()])
+                .collect();
+            let in_pieces = run(&per_char, false);
+            assert_eq!(
+                bytes(&in_pieces),
+                format!("{text}{CLOSE}"),
+                "{text:?}: in pieces"
+            );
+            assert_eq!(arguments(&in_pieces), expected, "{text:?}: in pieces");
+            assert_eq!(
+                malformed(&in_pieces),
+                malformed(&whole),
+                "{text:?}: in pieces"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_value_before_a_comma_reads_on_however_the_bytes_are_cut() {
+        // The reader of an empty bare value moves on without taking a byte; the next reader
+        // takes the same bytes, whole and in pieces alike, instead of the rest being held.
+        let text = "call:f{a:,<|\"|>X<|\"|>}";
+        let whole = run(&[text], false);
+        let per_char: Vec<&str> = text
+            .char_indices()
+            .map(|(i, c)| &text[i..i + c.len_utf8()])
+            .collect();
+        let in_pieces = run(&per_char, false);
+        assert_eq!(bytes(&whole), format!("{text}{CLOSE}"));
+        assert_eq!(bytes(&in_pieces), format!("{text}{CLOSE}"));
+        assert_eq!(arguments(&whole), r#"{"a": ""}"#);
+        assert_eq!(arguments(&in_pieces), arguments(&whole));
+        assert_eq!(malformed(&in_pieces), malformed(&whole));
+        assert_eq!(whole, in_pieces, "the same events");
+    }
+
+    #[test]
+    fn function_gemmas_spelling_reads_escape_strings_and_none_as_null() {
+        // functiongemma-270m-it/parse/call-nested-arguments, as the template writes it
+        let output =
+            "call:save_note{body:<escape>Line one\nLine two with \"quotes\" and a backslash \
+                      \\<escape>,meta:{nested:{deep:[1,2.5,true,None]}},tags:[<escape>a<escape>,\
+                      <escape>b<escape>],title:<escape>Plan<escape>}";
+        let mut assembler = Assembler::new(0, "call_0", Spelling::FUNCTION_GEMMA);
+        let mut out = Events::new();
+        assembler.feed(output, &mut out);
+        assembler.close("<end_function_call>", &mut out);
+        let events = out.drain();
+        assert_eq!(bytes(&events), format!("{output}<end_function_call>"));
+        assert_eq!(
+            arguments(&events),
+            "{\"body\": \"Line one\\nLine two with \\\"quotes\\\" and a backslash \\\\\", \
+             \"meta\": {\"nested\": {\"deep\": [1, 2.5, true, null]}}, \"tags\": [\"a\", \"b\"], \
+             \"title\": \"Plan\"}"
+        );
+        // Gemma 4's word is not this spelling's: a bare `null` is text the template never writes,
+        // kept as a string; the token cut across pieces is held until it is whole.
+        let mut assembler = Assembler::new(0, "call_0", Spelling::FUNCTION_GEMMA);
+        let mut out = Events::new();
+        for piece in ["call:f{a:null,b:<esc", "ape>x<escape>}"] {
+            assembler.feed(piece, &mut out);
+        }
+        assembler.close("<end_function_call>", &mut out);
+        assert_eq!(arguments(&out.drain()), "{\"a\": \"null\", \"b\": \"x\"}");
+    }
 
     #[test]
     fn a_rendered_call_gives_its_name_its_arguments_as_json_and_every_byte() {
@@ -645,13 +807,21 @@ mod tests {
             .any(|event| matches!(event, Event::ToolCallStart { .. })));
         assert_eq!(bytes(&not), format!("hello{{x:1}}{CLOSE}"));
         assert_eq!(malformed(&not)[0].1, NOT_A_CALL);
-        let tail = run(&["call:f{x:1} trailing"], false);
-        assert_eq!(arguments(&tail), r#"{"x": 1}"#);
-        assert_eq!(
-            malformed(&tail),
-            vec![(" trailing".to_string(), TEXT_AFTER_THE_OBJECT.to_string())]
-        );
-        assert_eq!(bytes(&tail), format!("call:f{{x:1}} trailing{CLOSE}"));
+        // The space before the text is the template's wrapping, the text is reported: the same
+        // two events however the bytes are cut.
+        for pieces in [&["call:f{x:1} trailing"][..], &["call:f{x:1} ", "trailing"]] {
+            let tail = run(pieces, false);
+            assert_eq!(arguments(&tail), r#"{"x": 1}"#);
+            assert_eq!(
+                malformed(&tail),
+                vec![("trailing".to_string(), TEXT_AFTER_THE_OBJECT.to_string())]
+            );
+            assert!(tail.iter().any(|event| matches!(
+                event,
+                Event::Dropped { text, why: DropReason::Wrapper } if text.text == " "
+            )));
+            assert_eq!(bytes(&tail), format!("call:f{{x:1}} trailing{CLOSE}"));
+        }
     }
 
     #[test]

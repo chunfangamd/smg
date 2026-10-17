@@ -25,9 +25,9 @@ use openai_protocol::common::Tool;
 use serde_json::{json, Value};
 
 use super::{
-    block_of,
+    calls,
     schema::{self, shape, Definitions},
-    CallMarkers, Grammar, Tag, WayIn,
+    CallMarkers, Count, Grammar, WayIn,
 };
 use crate::tagged::{assembler::TAGS, Spelling};
 
@@ -43,7 +43,7 @@ pub(super) fn calls(
     ways_in: &[WayIn<'_>],
     spelling: Spelling,
     tools: &[&Tool],
-    at_least_one: bool,
+    count: Count<'_>,
 ) -> Grammar {
     let values = Values {
         spelling,
@@ -57,34 +57,9 @@ pub(super) fn calls(
             &tool.function.parameters,
         )
     });
-    match markers.block.as_ref() {
-        Some(block) => {
-            let one_call = Grammar::Or(
-                calls
-                    .map(|(begin, content, end)| {
-                        Grammar::Sequence(vec![
-                            Grammar::ConstString(begin),
-                            content,
-                            Grammar::ConstString(end),
-                        ])
-                    })
-                    .collect(),
-            );
-            block_of(
-                ways_in,
-                Grammar::Plus(Box::new(one_call)),
-                block.close,
-                at_least_one,
-            )
-        }
-        None => Grammar::TriggeredTags {
-            triggers: vec![markers.call_open.to_string()],
-            tags: calls
-                .map(|(begin, content, end)| Tag::new(begin, content, end))
-                .collect(),
-            at_least_one,
-        },
-    }
+    calls::in_block(markers, ways_in, calls.collect(), count, |one_call| {
+        count.calls(one_call)
+    })
 }
 
 /// How a table's values are written: the family's spelling of what is not a string, and the
@@ -141,6 +116,7 @@ fn words<const N: usize>(schema: Value, python: [&str; N]) -> Grammar {
     let mut options = vec![Grammar::JsonSchema {
         schema,
         style: None,
+        excludes: Vec::new(),
     }];
     options.extend(
         python

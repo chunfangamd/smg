@@ -13,7 +13,7 @@ use super::{
         validate_stop, ChatLogProbs, ContextManagementEntry, ConversationRef, Detail, Function,
         FunctionChoice, GenerationRequest, PromptCacheRetention, PromptTokenUsageInfo,
         ResponsePrompt, StreamOptions, StringOrArray, ToolChoice as ChatToolChoice,
-        ToolChoiceValue as ChatToolChoiceValue, ToolReference, UsageInfo,
+        ToolChoiceValue as ChatToolChoiceValue, ToolReference, Usage, UsageInfo,
     },
     sampling_params::{validate_top_k_value, validate_top_p_value},
 };
@@ -2990,6 +2990,33 @@ impl From<UsageInfo> for ResponseUsage {
     }
 }
 
+/// The usage of an answer as the Responses API reports it, from the usage of
+/// a chat-style answer: the three counts with both detail objects present,
+/// zero included, the cached and reasoning counts read from the details the
+/// usage carries. A response's final object and its `response.completed`
+/// event build their usage here, so the two are the same.
+impl From<&Usage> for ResponseUsage {
+    fn from(usage: &Usage) -> Self {
+        Self {
+            input_tokens: usage.prompt_tokens,
+            output_tokens: usage.completion_tokens,
+            total_tokens: usage.total_tokens,
+            input_tokens_details: usage
+                .prompt_tokens_details
+                .as_ref()
+                .map(InputTokensDetails::from)
+                .unwrap_or_default(),
+            output_tokens_details: OutputTokensDetails {
+                reasoning_tokens: usage
+                    .completion_tokens_details
+                    .as_ref()
+                    .and_then(|details| details.reasoning_tokens)
+                    .unwrap_or(0),
+            },
+        }
+    }
+}
+
 impl ResponseUsage {
     /// Convert back to standard UsageInfo format
     pub fn to_usage_info(&self) -> UsageInfo {
@@ -3075,9 +3102,12 @@ pub struct ResponsesRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
 
-    /// Maximum number of output tokens (the public API's minimum is 16)
+    /// Maximum number of output tokens. At least 1, as `max_tokens` on the
+    /// chat endpoint: the vendors' Responses contracts accept small values
+    /// (a one-word answer under 8), so the public API's own floor of 16 is
+    /// not imposed on the models served here.
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[validate(custom(function = "validate_max_output_tokens"))]
+    #[validate(range(min = 1))]
     pub max_output_tokens: Option<u32>,
 
     /// Maximum number of tool calls
@@ -3688,23 +3718,6 @@ fn request_mentions_json(request: &ResponsesRequest) -> bool {
         }
         }),
     }
-}
-
-/// The public API's `max_output_tokens` minimum.
-const MIN_MAX_OUTPUT_TOKENS: u32 = 16;
-
-fn validate_max_output_tokens(value: u32) -> Result<(), ValidationError> {
-    if value < MIN_MAX_OUTPUT_TOKENS {
-        let mut e = ValidationError::new("integer_below_min_value");
-        e.message = Some(
-            format!(
-                "Invalid 'max_output_tokens': integer below minimum value. Expected a value >= {MIN_MAX_OUTPUT_TOKENS}, but got {value} instead."
-            )
-            .into(),
-        );
-        return Err(e);
-    }
-    Ok(())
 }
 
 /// The public API's metadata limits: 16 pairs, 64-character keys, 512-character string values.
@@ -4392,6 +4405,39 @@ impl ResponseReasoningContent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Responses API usage of a chat-style usage: both detail objects
+    /// present, zero included, the cached and reasoning counts from the
+    /// details the usage carries.
+    #[test]
+    fn response_usage_from_a_usage_carries_both_detail_objects() {
+        let usage = serde_json::to_value(ResponseUsage::from(
+            &Usage::from_counts(71, 16)
+                .with_cached_tokens(5)
+                .with_reasoning_tokens(3),
+        ))
+        .expect("a JSON usage");
+        assert_eq!(
+            usage,
+            serde_json::json!({
+                "input_tokens": 71,
+                "output_tokens": 16,
+                "total_tokens": 87,
+                "input_tokens_details": {"cached_tokens": 5},
+                "output_tokens_details": {"reasoning_tokens": 3},
+            })
+        );
+        let plain = serde_json::to_value(ResponseUsage::from(&Usage::from_counts(71, 16)))
+            .expect("a JSON usage");
+        assert_eq!(
+            plain["input_tokens_details"],
+            serde_json::json!({"cached_tokens": 0})
+        );
+        assert_eq!(
+            plain["output_tokens_details"],
+            serde_json::json!({"reasoning_tokens": 0})
+        );
+    }
 
     /// Lock `as_str()` to the canonical serde tag for the unit variants
     /// — drift between the two would produce inconsistent wire labels

@@ -38,19 +38,22 @@ use super::{
     },
     regular::stages::decisions::scoring::{DecisionPrompt, DecisionScoring},
     spec::ResponseSpec,
-    utils::ParserResolver,
+    utils::{ParserResolver, WorkerDecoding},
 };
 use crate::{
+    config::ParserChoice,
     middleware::TenantRequestMeta,
     observability::{cache_trace, metrics::Metrics},
     policies::CacheNamespace,
     routers::{
         common::{attempt_ledger::AttemptLedger, pd_admission::PdAdmissionGuard},
         error::internal_error,
+        grpc::regular::symphony::{template::Templates, PreparedConstraint},
     },
     worker::{
         ConnectionMode, PrefillLoadGuard, RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry,
     },
+    workflow::TokenizerLoadFailures,
 };
 
 /// Ingress-phase request context: owns the parsed request.
@@ -133,13 +136,12 @@ impl RequestType {
     /// decode leg recomputes the prompt locally instead of pulling the
     /// prefill leg's KV.
     pub fn sampling_n(&self) -> u32 {
-        let n = match self {
-            Self::Chat(r) => r.n,
-            Self::Completion(r) => r.n,
-            Self::Generate(r) => r.sampling_params.as_ref().and_then(|p| p.n),
-            _ => None,
-        };
-        n.filter(|&n| n > 0).unwrap_or(1)
+        match self {
+            Self::Chat(r) => r.choices(),
+            Self::Completion(r) => r.choices(),
+            Self::Generate(r) => r.choices(),
+            _ => 1,
+        }
     }
 
     /// Client-supplied backend request id (`rid`), where the protocol carries
@@ -199,6 +201,22 @@ pub(crate) struct SharedComponents {
     pub parser_resolver: ParserResolver,
     /// Multimodal processing components (initialized at router creation)
     pub multimodal: Option<Arc<MultimodalComponents>>,
+    /// Whether the gateway loads tokenizers itself, at start-up and when a
+    /// worker registers. While it does, a served model without a registered
+    /// tokenizer is a transient not-ready state (the one `/readiness` reports
+    /// as "tokenizer not yet registered"), not a fault of the gateway.
+    pub tokenizer_autoload: bool,
+    /// The served models whose tokenizer load was skipped or failed for good,
+    /// as the registration workflow recorded them: a request for one of them
+    /// is answered 503 `tokenizer_load_failed` without a retry hint, instead
+    /// of the not-ready 503 of a load in flight.
+    pub tokenizer_load_failures: Arc<TokenizerLoadFailures>,
+    /// Which parser reads a chat completion's or a message's output unless the request's
+    /// `X-SMG-Parser` header says otherwise (see `regular::symphony`).
+    pub parser: ParserChoice,
+    /// The tables the registered tokenizers' response templates compile into, which the parser
+    /// name `hf` selects (see `regular::symphony::template`).
+    pub templates: Arc<Templates>,
 }
 
 /// Ingress-phase state (evolves through preparation, worker selection,
@@ -207,6 +225,13 @@ pub(crate) struct SharedComponents {
 pub(crate) struct ProcessingState {
     // Stage 1: Preparation outputs
     pub preparation: Option<PreparationOutput>,
+
+    /// The parser for this chat completion or message. Preparation sets the request's choice,
+    /// from its `X-SMG-Parser` header or the configured default; request building then sets the
+    /// parser that reads the response, Symphony when a table takes the request and legacy
+    /// otherwise, which the response reports as `x-smg-parser`. `None` on the other endpoints,
+    /// which keep the legacy parsers.
+    pub parser: Option<ParserChoice>,
 
     /// Owned here rather than inside `PreparationOutput` so EPD's `EncodeStage`
     /// can borrow it for the with-pixels encode serialization before request
@@ -220,6 +245,20 @@ pub(crate) struct ProcessingState {
     /// Set once request building attached media references, so retry
     /// re-selection stays pinned to workers that accept them.
     pub media_refs_forwarded: bool,
+
+    /// The selected worker's constrained decoding, set when request building
+    /// let its policy choose the request's constraint
+    /// (`regular::symphony::WorkerConstraint::by_policy`), so retry
+    /// re-selection stays on workers that decide alike
+    /// (`utils::WorkerDecoding::decides_alike`).
+    pub constraint_decided_on: Option<WorkerDecoding>,
+
+    /// With forwarded references: which of the workers that process them the
+    /// plan may use (the gateway's own pipeline alone for a family only it
+    /// expands, the engine's own processors alone for audio, either
+    /// otherwise). Set in preparation with `multimodal_refs`; worker
+    /// selection and the retry pin read it.
+    pub media_refs_pipeline: PipelinePin,
 
     /// `Some` iff the request is multimodal EPD and worker selection produced
     /// encode assignments. Request building injects the bootstrap info and drops
@@ -260,6 +299,8 @@ pub(crate) struct ProcessingState {
 /// Worker-selection inputs that outlive the parsed request.
 #[derive(Default)]
 pub(crate) struct RoutingSnapshot {
+    /// Exact context checks retained for initial selection and retries.
+    pub context_requirements: super::common::stages::ContextRequirements,
     /// Captured only when a configured policy actually consumes request text.
     pub routing_text: Option<String>,
     /// Routing-affinity token proxy (first prompt for batched completions).
@@ -268,6 +309,12 @@ pub(crate) struct RoutingSnapshot {
     pub rid_key: Option<String>,
     /// The request's cache namespace, derived once at first selection.
     pub cache_namespace: Option<CacheNamespace>,
+    /// The request carries pixel media (an image or a video), noted at first
+    /// selection: a retry keeps the workers that take it (regular mode's
+    /// single worker; the prefill leg of prefill/decode mode, see worker
+    /// selection's `prefill_leg_needs_vision`) on ones with a vision encoder,
+    /// as the first attempt did.
+    pub needs_vision: bool,
     /// The request's disaggregated decode leg needs a worker with a vision
     /// encoder (worker selection's `decode_leg_needs_vision`: prefill/decode
     /// mode only), noted at first selection so a retry re-selects under the
@@ -275,21 +322,23 @@ pub(crate) struct RoutingSnapshot {
     pub decode_needs_vision: bool,
 }
 
-pub(crate) use crate::routers::common::placement::WireConstraint;
+pub(crate) use crate::routers::common::placement::{PipelinePin, WireConstraint};
 
 impl WireConstraint {
-    fn of(workers: &WorkerSelection, requires_media_refs: bool) -> Self {
+    fn of(workers: &WorkerSelection, requires_media_refs: bool, pipeline: PipelinePin) -> Self {
         match workers {
             WorkerSelection::Single { worker } => Self {
                 runtime: worker.metadata().spec.runtime_type,
                 connection: *worker.connection_mode(),
                 requires_media_refs,
+                pipeline,
             },
             // Disaggregated legs are gRPC-only.
             WorkerSelection::Disaggregated { runtime_type, .. } => Self {
                 runtime: *runtime_type,
                 connection: ConnectionMode::Grpc,
                 requires_media_refs,
+                pipeline,
             },
         }
     }
@@ -309,6 +358,8 @@ pub(crate) struct DispatchContext {
     /// unlike `root_request_id`, which cache tracing alone fills.
     pub request_id: Option<String>,
     pub cache_trace: Option<String>,
+    /// The parser that read a chat completion, for the response's `x-smg-parser` header.
+    pub parser: Option<ParserChoice>,
     pub attempt: u32,
     /// The request's bookkeeping across attempts: circuit-breaker charges
     /// and the workers whose answer was definitive.
@@ -327,6 +378,9 @@ pub(crate) struct DispatchContext {
     pub rate_limit_cell: Option<Arc<RateLimitCell>>,
     pub routing: RoutingSnapshot,
     pub wire: WireConstraint,
+    /// The selected worker's constrained decoding, when its policy chose the
+    /// plan's constraint; a retry re-selects only workers that decide alike.
+    pub constraint_decided_on: Option<WorkerDecoding>,
     pub tokenizer: Option<Arc<dyn Tokenizer>>,
     pub workers: Option<WorkerSelection>,
     pub sticky_key: Option<String>,
@@ -534,12 +588,18 @@ pub(crate) enum PreparationOutput {
     Chat {
         token_ids: Vec<u32>,
         processed_messages: super::ProcessedMessages,
-        tool_constraints: Option<(String, String)>,
+        /// Request building decides on the selected worker
+        /// (`regular::symphony::worker_constraint`).
+        tool_constraints: PreparedConstraint,
     },
     Messages {
         token_ids: Vec<u32>,
         processed_messages: super::ProcessedMessages,
-        tool_constraints: Option<(String, String)>,
+        tool_constraints: PreparedConstraint,
+        /// The response spec, built by preparation: the template rendered
+        /// the view of its chat tools that `tool_choice` leaves (see
+        /// `MessagesResponseSpec`).
+        spec: Box<super::spec::MessagesResponseSpec>,
     },
     /// Transcription reuses the chat backend request shape. The chat-shaped
     /// request is synthesized here (inside the pipeline) from the family's
@@ -919,6 +979,7 @@ impl RequestContext {
             RequestType::Transcription { request, .. } => request.model.clone(),
         };
         drop(request_type);
+        let parser = state.parser;
         drop(components);
         let routing = state.routing_snapshot.ok_or_else(|| {
             error!(
@@ -933,7 +994,17 @@ impl RequestContext {
         let wire = state
             .workers
             .as_ref()
-            .map(|workers| WireConstraint::of(workers, state.media_refs_forwarded))
+            .map(|workers| {
+                WireConstraint::of(
+                    workers,
+                    state.media_refs_forwarded,
+                    if state.media_refs_forwarded {
+                        state.media_refs_pipeline
+                    } else {
+                        PipelinePin::Any
+                    },
+                )
+            })
             .ok_or_else(|| {
                 error!(
                     function = "RequestContext::into_dispatch",
@@ -955,6 +1026,7 @@ impl RequestContext {
             },
             request_id,
             cache_trace: None,
+            parser,
             attempt: 0,
             ledger: AttemptLedger::default(),
             tried: Vec::new(),
@@ -965,6 +1037,7 @@ impl RequestContext {
             rate_limit_cell,
             routing,
             wire,
+            constraint_decided_on: state.constraint_decided_on,
             tokenizer: state.tokenizer,
             workers: state.workers,
             sticky_key: state.sticky_key,

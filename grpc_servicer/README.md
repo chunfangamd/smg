@@ -60,6 +60,15 @@ takes the variable as its documented setting and logs nothing. The startup
 line `VllmEngineServicer initialized (mm_processor=inprocess, source=flag)` and
 the `mm_processor_source` label name where the value came from.
 
+A model family whose reference image processor raises a short side below a
+floor before its own resize (MiniMax-M3: 112 px) gets the same raise on the
+worker: `inprocess` and the sidecar raise such an image to the floor, bicubic,
+before the engine's processor sizes it, as the router's own pipeline does, so
+a tiny image costs the same visual tokens whichever component preprocessed it
+(video frames are not raised, as there). An engine started with
+`--mm-processor-kwargs '{"do_resize": false}'` raises nothing, as the pipeline
+raises nothing then.
+
 The worker then advertises `mm_processor=inprocess` and `mm_media_ref_schemes`
 through `GetServerInfo`; a router with media-reference support forwards
 `media_refs` only to workers that advertise, and a router without it ignores the
@@ -69,7 +78,11 @@ multimodal engine also advertises its resolved `--limit-mm-per-prompt` as
 itself holds requests to the engine's limits. vLLM's `--allowed-media-domains`,
 `--allowed-local-media-path`, `--media-io-kwargs`, `--limit-mm-per-prompt` and
 `VLLM_*_FETCH_TIMEOUT` govern fetching on the worker; without
-`--allowed-media-domains` the worker fetches from any host the router forwards.
+`--allowed-media-domains` the worker fetches from any public host the router
+forwards. A media URL that names or resolves to a loopback, link-local or
+private address is refused on the worker as on the router, redirects included,
+unless `SMG_MM_ALLOW_PRIVATE_MEDIA_HOSTS=1` is set for a deployment whose media
+origin is internal.
 Related knobs: `--mm-max-inflight` (`SMG_VLLM_MM_MAX_INFLIGHT`, default 64)
 bounds concurrent media jobs; `--mm-max-items` (`SMG_VLLM_MM_MAX_ITEMS`, unset
 by default) overrides the model's per-modality reference limits;
@@ -78,13 +91,28 @@ by default) overrides the model's per-modality reference limits;
 meaning vLLM's own `--media-io-kwargs` decide) caps the frames a video is
 sampled to, so long clips stay bounded. All eight flag-backed settings are
 validated when the servicer starts, whatever the processor mode, so a stale
-unreadable value fails loudly.
+unreadable value fails loudly. Two layers bound an inline item: the router
+refuses a `data:` item above its own per-kind input bound
+(`SMG_IMAGE_MAX_INPUT_BYTES`, `SMG_VIDEO_MAX_INPUT_BYTES`,
+`SMG_AUDIO_MAX_INPUT_BYTES`; default 256 MiB each) with a 400
+`media_ref_too_large` before the worker sees it, and the worker refuses one
+above `--mm-max-item-bytes` with a message that names the worker as the flag's
+owner, which the router relays as a 400 `start_generation_failed`. With the
+defaults a 50 MB item clears the router and stops at the worker's 32 MiB, so
+that flag is the one to raise; the router's `--max-payload-size` (default
+512 MiB) must also hold the whole request body.
 
 On the router side, `--mm-processing` selects `auto` (default: forward when
-the model's spec opts in and every registered worker of the model advertises
-`mm_processor`), `router` (always preprocess) or `worker` (strict: 400 when a
-request cannot be forwarded); the outcome is counted in
-`smg_mm_processing_total{model,mode,reason}`, and the startup line
+every registered worker of the model advertises `mm_processor` and the model's
+spec opts in, or every one of those workers runs the router's own pipeline,
+`mm_processor=smg`, which expands any spec's image or video anchor itself), `router` (always
+preprocess) or `worker` (strict: 400 when a request cannot be forwarded; a
+family without the opt-in forwards when every media-processing worker of the
+model runs `smg`, and its requests are placed on `smg` workers only, so a
+worker on the engine's own processor never receives an anchor it cannot
+expand); the outcome is counted in
+`smg_mm_processing_total{model,mode,reason}` (`pipeline_workers` and
+`auto_pipeline` name the forwarded-by-the-pipeline case), and the startup line
 `multimodal processing mode` names the value and its source (`flag`, `env` or
 `default`). `SMG_MM_PROCESSING` is the deprecated env fallback: it applies only
 when the flag is absent, logs a deprecation line, and goes away in the next
@@ -149,12 +177,13 @@ Router cannot tell the two apart.
 vllm serve Qwen/Qwen3-0.6B --grpc --port 50051
 
 # Rust request path, same entrypoint. The flag is this package's: vLLM loads
-# it as a general plugin while it builds the parser (smg_grpc_servicer/vllm/plugin.py).
+# it as a general plugin while it builds the parser (smg_grpc_servicer/vllm/plugin.py);
+# the stock launcher's own parser (`python -m` below) takes it too.
 vllm serve Qwen/Qwen3-0.6B --grpc --port 50051 --servicer-impl rust
 
-# The environment form works for the import-based entrypoints too (`vllm serve --grpc`,
-# the deprecated `python -m vllm.entrypoints.grpc_server`); a launcher file executed
-# directly as __main__ is not switched and refuses the flag instead.
+# The environment form, as a deployment sets it, works for every entry: `vllm serve --grpc`,
+# and `python -m` on the launcher module (`vllm.entrypoints.grpc_server` is the launcher itself
+# on vLLM 0.28 and 0.29, and from 0.30 a shim importing `vllm.entrypoints.launchers.grpc_server`).
 SMG_VLLM_SERVICER_IMPL=rust python -m vllm.entrypoints.grpc_server --model Qwen/Qwen3-0.6B --port 50051
 ```
 
@@ -168,10 +197,60 @@ if resolve_servicer_impl(args) == "rust":
     raise SystemExit(await serve_rust(args))
 ```
 
+##### Supported vLLM releases
+
+The switch binds `serve_grpc` in the launcher module of the installed release
+(`launcher_switch.LAUNCHERS`, newest first):
+
+| vLLM | launcher module | what `python -m vllm.entrypoints.grpc_server` runs |
+|---|---|---|
+| 0.30 and later | `vllm.entrypoints.launchers.grpc_server` | a shim importing the launcher, which is bound as it loads |
+| 0.28 and 0.29 | `vllm.entrypoints.grpc_server` | the launcher itself, as `__main__` |
+
+Verified on 0.28 through 0.31 (`launcher_switch.SUPPORTED_VLLM_RELEASES`),
+for every entry. `vllm serve <model> --grpc` imports the launcher under its
+name after the parse, and the import-time hook (or the finder) binds it.
+`python -m` on the launcher module itself runs it as `__main__`, where no
+import hook reaches it, so it is bound in its own namespace from the two
+moments this package runs inside the launcher's `main()` once `serve_grpc`
+exists: vLLM loads the plugin while the launcher builds its parser
+(`AsyncEngineArgs.add_cli_args`), and the plugin's parse step runs on the
+launcher's own parse. A main-branch build between two releases carries the
+next release's layout under the earlier version; the binding goes by what is
+loaded, never by the version. A launcher run as a file path, or with the
+plugin left out of `VLLM_PLUGINS`, is not reached; the Python servicer then
+refuses the flag with one line.
+
+The CPU smoke behind that table (`scripts/launcher_switch_smoke.py`) runs each
+launcher through to the servicer construction against a stub engine, in a
+fresh interpreter per case, and checks that Rust takes the process before any
+engine exists and that the Python default still constructs the servicer:
+
+```bash
+# The vendored upstream launchers (tests/launchers/, one per layout); no vLLM needed.
+pytest -q grpc_servicer/tests/test_vllm_launcher_switch_main.py
+# A launcher tree extracted from a wheel (vllm/entrypoints/**/grpc_server.py), the rest stubbed.
+python -I grpc_servicer/scripts/launcher_switch_smoke.py --launcher-tree <dir> --servicer-root grpc_servicer
+# The installed vLLM (a CPU-only container with the engine image is enough): its real launcher,
+# CLI, parser and plugin loading, with only the engine stubbed; no model is read.
+python -I grpc_servicer/scripts/launcher_switch_smoke.py --installed
+```
+
+The switch verifies its hook at start-up: once the Rust implementation is
+selected, the launcher's own argument parse (the plugin's parse step) checks
+that the switch is bound over the launcher (the table above; a launcher run
+as `__main__` is checked in its own namespace), importing the module under
+its known names where the CLI has not yet, and a launcher the switch cannot
+bind (one without `serve_grpc`, a release that moved the module) is refused
+with one ERROR line naming the installed vLLM version and the launchers the
+switch binds, exit code 2, before the engine is built, rather than by the
+Python servicer's guard after the model has loaded.
+
 `smg serve --backend vllm --connection-mode grpc --servicer-impl rust` sets
 the flag in each worker's environment, after checking that the installed
 vLLM's launcher will consult it (`smg_grpc_servicer.vllm.rust.upstream_hook_installed`:
-it imports this package at module level, or carries the check itself); the
+a launcher at a module path the switch binds imports this package at module
+level, or a launcher anywhere carries the check itself); the
 Python servicer refuses to start when the flag asks for Rust, so a launcher
 that reaches it anyway fails loudly instead of silently running Python. The
 headless engine is launched from the parsed namespace through vLLM's own
@@ -222,9 +301,13 @@ Worker-side media processing uses the same `--mm-processor` /
   the same way. It serves the model families that pipeline supports
   (`crates/multimodal`), takes `http`, `https` and `data` references, reads
   the model's `config.json` and preprocessor configs from the tokenizer
-  directory the launcher resolved, refuses a request above the engine's own
-  `--limit-mm-per-prompt` as the engine's server does (`--mm-max-items` and
-  `SMG_*_MAX_COUNT` tighten those limits, never loosen them), and samples a
+  directory the launcher resolved, lays the engine's `--mm-processor-kwargs`
+  over those preprocessor configs as the engine's own processor would take
+  them (less `device`, which only says where that processor would run; a key
+  the pipeline has no field for is refused at launch), refuses a request
+  above the engine's own `--limit-mm-per-prompt` as the engine's server does
+  (`--mm-max-items` and `SMG_*_MAX_COUNT` tighten those limits, never loosen
+  them), and samples a
   video to the engine's own frame budget (`--media-io-kwargs`
   `video.num_frames`, else its loader's default) where the family's processor
   takes the loader's frames, so a clip costs the same tokens as on the engine's
@@ -243,7 +326,14 @@ Worker-side media processing uses the same `--mm-processor` /
   takes raw `uint8` pixels, and the pipeline writes those for it; a model
   whose processor cannot emit raw pixels is refused at startup under that
   setting (start the engine with `--mm-device-do-normalize=false` or use
-  `inprocess`). The Python servicer refuses `smg`: it has no such processor.
+  `inprocess`). The Python servicer refuses `smg`: it has no such processor, and
+  the launcher's switch refuses it before the engine is built and the model
+  loaded (one configuration-error line, exit code 2), not after.
+
+An audio reference (a family whose audio the engine's own processor takes)
+reaches `inprocess` and `redis` on the Rust servicer as it does on the Python
+servicer; the `smg` pipeline takes image and video references and refuses an
+audio one before any work, naming the modes that take it.
 
 The in-flight cap, the saturation refusal, the advertised `mm_processor` /
 `mm_media_ref_schemes` / `mm_processor_source` and the PD prefill leg's
@@ -263,13 +353,54 @@ structured request either way, as it does behind vLLM's own frontend.
 Both vLLM servicers also advertise the engine's reasoning parser
 (`engine_reasoning_parser`; `reasoning_parser` is the per-model parser override
 a router reads off a worker's labels) and where its grammar starts on a prompt
-that ends inside the model's thinking block (`structured_outputs_start`): `after_reasoning` when
+that ends inside the model's thinking block (`constrained_decoding_start`): `after_reasoning` when
 a reasoning parser is set and `enable_in_reasoning` is off, since vLLM then
 holds a request's grammar back until the parser has seen the thought's end,
 `first_token` otherwise. A router shapes a forced tool call's grammar by it as
 the engine's own server would: the bare calls behind the parser's gate, so the
 call is forced right there; the thought and then the calls from the first
 token.
+
+#### CUDA-graph capture cap
+
+The engine replays a captured CUDA graph for a step that fits one of its
+capture sizes and runs a larger step eagerly, kernel by kernel from Python.
+Its default for the largest size (`max_cudagraph_capture_size`) is twice
+`--max-num-seqs`, at most 512 (1024 on one newer GPU platform): with a window
+of 32 that is 64 tokens, so a step that admits a prefill chunk beside the
+decodes runs eagerly, and an engine whose eager step is expensive (a
+sparse-attention or MoE model: hundreds of launches per rank) is host-bound at
+every admission. A gRPC launch (`vllm serve --grpc`, the stock launcher, and
+`vllm serve --headless` for the engine-only ranks of a multi-node engine)
+therefore derives the cap from the admission step when the operator set none:
+`--max-num-batched-tokens` (unset: unbounded, the engine's own step-size
+defaults are 2048 or more), at most 512, applied only where it raises the
+engine's default, for both servicer implementations, and logged once at start
+(`CUDA-graph capture cap: ...`). The engine's rule is kept: the value is the
+step size itself or a value of the engine's capture grid (1, 2, 4, multiples
+of 8 to 248, multiples of 16 from 256), which the engine neither clamps nor
+truncates.
+
+| setting | engine default | launch default |
+|---|---|---|
+| `--max-num-seqs 32 --max-num-batched-tokens 16384` | 64 | 512 |
+| `--max-num-seqs 32 --max-num-batched-tokens 300` | 64 | 300 |
+| `--max-num-seqs 32`, step size unset | 64 | 512 |
+| `--max-num-seqs 32 --max-num-batched-tokens 48` | 48 | the engine's |
+| `--max-num-seqs 256` or more | 512 | the engine's |
+| `--max-num-seqs` unset | 512 (the engine's window defaults) | the engine's |
+
+Kept as given: an explicit `--max-cudagraph-capture-size`,
+`--cudagraph-capture-sizes` or the same keys of `--compilation-config`;
+`--enforce-eager` and a `cudagraph_mode` of `NONE` (no graphs); a
+`--speculative-config` (the engine's default adds the uniform-decode sizes an
+explicit cap drops); an HTTP `vllm serve`, which is not this package's launch.
+
+`SMG_VLLM_CUDAGRAPH_CAPTURE_CAP` is the knob: `auto` (the default), `engine`
+(the opt-out: the engine's own default, as before this derivation), or a
+positive integer, the ceiling in place of 512, rounded down to the capture
+grid. Each captured size costs capture time at start and graph memory per
+rank: 11 sizes at the engine's 64, 51 at 512, 83 at 1024.
 
 #### Multi-node engines: the worker pod's liveness
 
@@ -373,12 +504,25 @@ Both TokenSpeed servicers advertise, as `server_args` keys, the engine's
 reasoning parser (`engine_reasoning_parser`; `reasoning_parser` is the
 per-model parser override a router reads off a worker's labels) and where its
 grammar starts on a prompt that ends inside the model's thinking block
-(`structured_outputs_start`): always `first_token`, since this engine's grammar
+(`constrained_decoding_start`): always `first_token`, since this engine's grammar
 manager has no reasoning gate and starts every grammar at the first generated
 token (`--reasoning-parser` only has a JSON-schema constraint rewritten into a
 structural tag that lets the thought precede the JSON). A router shapes a
 forced tool call's grammar by it as the engine's own server would: the thought
 and then the calls, so the call is not forced into the thought.
+
+Both TokenSpeed servicers also report the engine's constrained-decoding policy,
+when it declares one, as `GetServerInfo.constrained_decoding` (a field of its
+own, not a `server_args` key): `always` for a model that takes a grammar on
+every turn, `requested` for one only when the request asks. The servicers read
+it as `constrained_decoding` off TokenSpeed's `ServerArgs`, else its
+`ModelConfig`. A router turns the field into the worker's `constrained_decoding`
+label, and its gRPC request building follows the selected worker's policy (under
+PD the decode worker's). `requested`, the default, constrains what a request asks
+for. `always`, on an engine that starts the grammar at the first token, gives
+every turn the grammar of the model's response template table where that table
+spells whole turns; otherwise it constrains the calls a tool request allows under
+`auto`.
 
 #### Multi-node engines: the worker pod's liveness
 
@@ -430,7 +574,7 @@ label is absent.
 They also advertise, as `server_args` keys, the engine's reasoning parser
 (`engine_reasoning_parser`; `reasoning_parser` is the per-model parser override
 a router reads off a worker's labels) and where its grammar starts on a prompt
-that ends inside the model's thinking block (`structured_outputs_start`):
+that ends inside the model's thinking block (`constrained_decoding_start`):
 `after_reasoning` with `--reasoning-parser`, since the scheduler then wraps its
 grammar backend in a reasoner that holds a request's grammar back until the
 parser's thought-end sequence has been generated (for a request that asks for

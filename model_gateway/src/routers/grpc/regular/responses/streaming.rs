@@ -7,6 +7,7 @@
 
 use std::{
     collections::HashMap,
+    fmt,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -55,7 +56,7 @@ use crate::{
         grpc::{
             common::responses::{
                 await_stream_startup, build_sse_response, persist_response_if_needed,
-                signal_stream_startup, stream_startup_channel,
+                signal_stream_startup, stored_foreground, stream_startup_channel,
                 streaming::{
                     attach_mcp_server_label, ResponseStreamEventEmitter, StreamStartupSender,
                 },
@@ -90,6 +91,7 @@ pub(super) async fn convert_chat_stream_to_responses_stream(
 ) -> Response {
     debug!("Converting chat SSE stream to responses SSE format");
     let response_id = params.response_id;
+    let tenant = crate::tenant::storage_tenant(&params.tenant_request_meta);
 
     // Get chat streaming response
     let chat_response = ctx
@@ -145,6 +147,7 @@ pub(super) async fn convert_chat_stream_to_responses_stream(
             response_storage,
             conversation_storage,
             conversation_item_storage,
+            tenant,
             request_context,
             tx.clone(),
         )
@@ -190,6 +193,56 @@ fn sse_events(frame: &str) -> impl Iterator<Item = &str> {
         .filter(|event| !event.is_empty())
 }
 
+/// One `data:` event of the chat stream's body, as the Responses conversions
+/// read it: the chat chunk it carries, the chat stream's error event as the
+/// error object a Responses terminal carries, the `[DONE]` terminator, or any
+/// other data event, left to the reader. Lines that are not data events (a
+/// comment, a keep-alive) are nobody's and are not yielded.
+enum ChatSseEvent<'a> {
+    Chunk(ChatCompletionStreamResponse),
+    UpstreamError(Value),
+    Done,
+    Other(&'a str),
+}
+
+/// The data events of one frame of the chat stream's body, in order; the
+/// reader stops at [`ChatSseEvent::Done`].
+fn chat_sse_events(frame: &str) -> impl Iterator<Item = ChatSseEvent<'_>> {
+    sse_events(frame).filter_map(|event| {
+        if event == "data: [DONE]" {
+            return Some(ChatSseEvent::Done);
+        }
+        let data = event.strip_prefix("data: ")?.trim();
+        if let Ok(chunk) = serde_json::from_str::<ChatCompletionStreamResponse>(data) {
+            return Some(ChatSseEvent::Chunk(chunk));
+        }
+        let error = serde_json::from_str::<Value>(data)
+            .ok()
+            .and_then(|value| value.get("error").map(upstream_error_object));
+        Some(match error {
+            Some(error) => ChatSseEvent::UpstreamError(error),
+            None => ChatSseEvent::Other(event),
+        })
+    })
+}
+
+/// The error object of a Responses terminal for the chat stream's error
+/// event: its `code`, else its `type`, else `server_error`; its `message`,
+/// else the generic wording.
+fn upstream_error_object(error: &Value) -> Value {
+    json!({
+        "code": error.get("code").and_then(Value::as_str)
+            .or_else(|| error.get("type").and_then(Value::as_str)).unwrap_or("server_error"),
+        "message": error.get("message").and_then(Value::as_str).unwrap_or("Upstream generation failed"),
+    })
+}
+
+/// The error object of a Responses terminal for a chat body the gateway
+/// could not read.
+fn stream_read_error(error: &impl fmt::Display) -> Value {
+    json!({"code": "stream_error", "message": format!("Stream read error: {error}")})
+}
+
 /// Process chat SSE stream and transform to responses format
 #[expect(
     clippy::too_many_arguments,
@@ -202,6 +255,7 @@ async fn process_and_transform_sse_stream(
     response_storage: Arc<dyn ResponseStorage>,
     conversation_storage: Arc<dyn ConversationStorage>,
     conversation_item_storage: Arc<dyn ConversationItemStorage>,
+    tenant: Option<String>,
     request_context: Option<StorageRequestContext>,
     tx: SseSender,
 ) -> Result<(), String> {
@@ -247,46 +301,25 @@ async fn process_and_transform_sse_stream(
         let chunk = match chunk_result {
             Ok(chunk) => chunk,
             Err(error) => {
-                terminal_error = Some(
-                    json!({"code": "stream_error", "message": format!("Stream read error: {error}")}),
-                );
+                terminal_error = Some(stream_read_error(&error));
                 break;
             }
         };
 
         let frame = String::from_utf8_lossy(&chunk);
-        for event in sse_events(&frame) {
-            // Check for end of stream
-            if event == "data: [DONE]" {
-                break 'frames;
-            }
-
-            // Parse SSE event (format: "data: {...}")
-            let Some(json_str) = event.strip_prefix("data: ") else {
-                continue;
-            };
-            let json_str = json_str.trim();
-
-            // Try to parse as ChatCompletionStreamResponse
-            match serde_json::from_str::<ChatCompletionStreamResponse>(json_str) {
-                Ok(chat_chunk) => {
-                    // Update accumulator
+        for event in chat_sse_events(&frame) {
+            match event {
+                ChatSseEvent::Done => break 'frames,
+                ChatSseEvent::Chunk(chat_chunk) => {
                     accumulator.process_chunk(&chat_chunk);
-
-                    // Process chunk through event emitter (emits proper OpenAI events)
                     event_emitter.process_chunk(&chat_chunk, &tx).await?;
                 }
-                Err(_) => {
-                    if let Ok(value) = serde_json::from_str::<Value>(json_str) {
-                        if let Some(error) = value.get("error") {
-                            terminal_error = Some(json!({
-                                "code": error.get("code").and_then(Value::as_str).or_else(|| error.get("type").and_then(Value::as_str)).unwrap_or("server_error"),
-                                "message": error.get("message").and_then(Value::as_str).unwrap_or("Upstream generation failed"),
-                            }));
-                            break 'frames;
-                        }
-                    }
-                    // Pass through unrecognized non-error events.
+                ChatSseEvent::UpstreamError(error) => {
+                    terminal_error = Some(error);
+                    break 'frames;
+                }
+                // Pass through unrecognized non-error events.
+                ChatSseEvent::Other(event) => {
                     debug!("Non-chunk SSE event, passing through: {}", event);
                     if tx
                         .send(Ok(Bytes::from(format!("{event}\n\n"))))
@@ -311,18 +344,36 @@ async fn process_and_transform_sse_stream(
         final_response.error = Some(error.clone());
     }
     let usage_json = final_response.usage.as_ref().map(|usage| json!(usage));
-    event_emitter
-        .emit_terminal(usage_json.as_ref(), terminal_error.as_ref(), &tx)
-        .await?;
-    persist_response_if_needed(
+    let persist = persist_response_if_needed(
         conversation_storage,
         conversation_item_storage,
         response_storage,
         &final_response,
         &original_request,
+        tenant.as_deref(),
         request_context,
-    )
-    .await;
+    );
+    if stored_foreground(&original_request) {
+        // A foreground response the client expects stored is written before
+        // its terminal event: a record that could not be written ends the
+        // stream with response.failed, not with a completed response that
+        // can be neither retrieved nor continued.
+        let not_stored = persist.await.err().map(|e| e.error_object());
+        let error = terminal_error.as_ref().or(not_stored.as_ref());
+        event_emitter
+            .emit_terminal(usage_json.as_ref(), error, &tx)
+            .await?;
+    } else {
+        // A background response's terminal write is retried behind the event
+        // (its client polls the record); an unstored response stores
+        // nothing. Neither fails the stream.
+        event_emitter
+            .emit_terminal(usage_json.as_ref(), terminal_error.as_ref(), &tx)
+            .await?;
+        if let Err(e) = persist.await {
+            debug!(response_id = %final_response.id, error = %e.message, "Response not stored");
+        }
+    }
 
     Ok(())
 }
@@ -621,7 +672,9 @@ async fn execute_tool_loop_streaming_internal(
     tx: SseSender,
     mut startup: Option<StreamStartupSender>,
 ) -> Result<(), String> {
-    let mut state = ToolLoopState::new(original_request);
+    // The loop is rebuilt on the loaded request: a stored turn's tool calls
+    // and outputs stay in front of the calls this loop executes.
+    let mut state = ToolLoopState::new(&current_request);
     let max_tool_calls = original_request.max_tool_calls.map(|n| n as usize);
 
     // Generate response ID first so we can use it for both emitter and session
@@ -1016,26 +1069,44 @@ async fn execute_tool_loop_streaming_internal(
     };
 
     let terminal_usage = state.usage.as_ref().map(|usage| json!(usage));
-    emitter
-        .emit_terminal(terminal_usage.as_ref(), terminal_error.as_ref(), &tx)
-        .await?;
-
-    // Store the final object, as the other streaming paths do; a background
-    // response needs its terminal record under the id the client polls.
+    // The final object, read before the terminal event drains the emitter's
+    // items; a background response needs its terminal record under the id
+    // the client polls.
     let mut final_response = emitter.finalize(None);
     final_response.usage = state.usage.clone().map(ResponsesUsage::Modern);
-    if let Some(error) = terminal_error {
+    if let Some(error) = terminal_error.clone() {
+        // The emitter learns of the failure from the terminal event, which
+        // now follows the final object: the stored record says failed itself.
+        final_response.status = ResponseStatus::Failed;
+        final_response.incomplete_details = None;
         final_response.error = Some(error);
     }
-    persist_response_if_needed(
+    let tenant = crate::tenant::storage_tenant(&params.tenant_request_meta);
+    let persist = persist_response_if_needed(
         ctx.conversation_storage.clone(),
         ctx.conversation_item_storage.clone(),
         ctx.response_storage.clone(),
         &final_response,
         original_request,
+        tenant.as_deref(),
         ctx.request_context.clone(),
-    )
-    .await;
+    );
+    if stored_foreground(original_request) {
+        // Written before its terminal event: a record that could not be
+        // written ends the stream with response.failed.
+        let not_stored = persist.await.err().map(|e| e.error_object());
+        let error = terminal_error.as_ref().or(not_stored.as_ref());
+        emitter
+            .emit_terminal(terminal_usage.as_ref(), error, &tx)
+            .await?;
+    } else {
+        emitter
+            .emit_terminal(terminal_usage.as_ref(), terminal_error.as_ref(), &tx)
+            .await?;
+        if let Err(e) = persist.await {
+            debug!(response_id = %final_response.id, error = %e.message, "Response not stored");
+        }
+    }
     Ok(())
 }
 
@@ -1055,70 +1126,53 @@ async fn convert_and_accumulate_stream(
 
     // A frame holds one or more SSE events; every one of them counts.
     'frames: while let Some(chunk_result) = stream.next().await {
-        let chunk = chunk_result.map_err(|error| {
-            json!({
-                "code": "stream_error", "message": format!("Stream read error: {error}"),
-            })
-        })?;
+        let chunk = chunk_result.map_err(|error| stream_read_error(&error))?;
         let frame = String::from_utf8_lossy(&chunk);
-        for event in sse_events(&frame) {
-            if event == "data: [DONE]" {
-                break 'frames;
-            }
-            let Some(json_str) = event.strip_prefix("data: ") else {
-                continue;
+        for event in chat_sse_events(&frame) {
+            let mut chat_chunk = match event {
+                ChatSseEvent::Done => break 'frames,
+                ChatSseEvent::Chunk(chunk) => chunk,
+                ChatSseEvent::UpstreamError(error) => return Err(error),
+                ChatSseEvent::Other(_) => continue,
             };
-            let json_str = json_str.trim();
-            if let Ok(mut chat_chunk) =
-                serde_json::from_str::<ChatCompletionStreamResponse>(json_str)
-            {
-                // Keep all calls for server execution; only client-owned calls
-                // may be exposed as Responses function_call items and events.
-                accumulator.process_chunk(&chat_chunk);
-                if let Some(choice) = chat_chunk.choices.first_mut() {
-                    if let Some(calls) = choice.delta.tool_calls.take() {
-                        let mut visible = Vec::new();
-                        for call in calls {
-                            let index = call.index;
-                            if let Some(name) = call
-                                .function
-                                .as_ref()
-                                .and_then(|f| f.name.as_deref())
-                                .filter(|name| !name.is_empty())
-                            {
-                                mcp_indices
-                                    .entry(index)
-                                    .or_insert_with(|| is_mcp_tool(name));
-                            }
-                            pending.entry(index).or_default().push(call);
-                            if let Some(is_mcp) = mcp_indices.get(&index) {
-                                if let Some(deltas) = pending.remove(&index) {
-                                    if !is_mcp {
-                                        visible.extend(deltas);
-                                    }
+            // Keep all calls for server execution; only client-owned calls
+            // may be exposed as Responses function_call items and events.
+            accumulator.process_chunk(&chat_chunk);
+            if let Some(choice) = chat_chunk.choices.first_mut() {
+                if let Some(calls) = choice.delta.tool_calls.take() {
+                    let mut visible = Vec::new();
+                    for call in calls {
+                        let index = call.index;
+                        if let Some(name) = call
+                            .function
+                            .as_ref()
+                            .and_then(|f| f.name.as_deref())
+                            .filter(|name| !name.is_empty())
+                        {
+                            mcp_indices
+                                .entry(index)
+                                .or_insert_with(|| is_mcp_tool(name));
+                        }
+                        pending.entry(index).or_default().push(call);
+                        if let Some(is_mcp) = mcp_indices.get(&index) {
+                            if let Some(deltas) = pending.remove(&index) {
+                                if !is_mcp {
+                                    visible.extend(deltas);
                                 }
                             }
                         }
-                        choice.delta.tool_calls = (!visible.is_empty()).then_some(visible);
                     }
-                }
-                emitter
-                    .process_chunk(&chat_chunk, tx)
-                    .await
-                    .map_err(|message| {
-                        json!({
-                            "code": "stream_error", "message": message,
-                        })
-                    })?;
-            } else if let Ok(value) = serde_json::from_str::<Value>(json_str) {
-                if let Some(error) = value.get("error") {
-                    return Err(json!({
-                        "code": error.get("code").and_then(Value::as_str)
-                            .or_else(|| error.get("type").and_then(Value::as_str)).unwrap_or("server_error"),
-                        "message": error.get("message").and_then(Value::as_str).unwrap_or("Upstream generation failed"),
-                    }));
+                    choice.delta.tool_calls = (!visible.is_empty()).then_some(visible);
                 }
             }
+            emitter
+                .process_chunk(&chat_chunk, tx)
+                .await
+                .map_err(|message| {
+                    json!({
+                        "code": "stream_error", "message": message,
+                    })
+                })?;
         }
     }
     Ok(accumulator.finalize())
@@ -1309,6 +1363,7 @@ mod tests {
                 Arc::new(smg_data_connector::MemoryConversationStorage::new()),
                 Arc::new(smg_data_connector::MemoryConversationItemStorage::new()),
                 None,
+                None,
                 tx,
             )
             .await
@@ -1488,6 +1543,7 @@ mod tests {
             Arc::new(smg_data_connector::MemoryResponseStorage::new()),
             Arc::new(smg_data_connector::MemoryConversationStorage::new()),
             Arc::new(smg_data_connector::MemoryConversationItemStorage::new()),
+            None,
             None,
             tx,
         )
@@ -1749,6 +1805,48 @@ mod tests {
             .contains("connection reset"));
     }
 
+    /// One reader for the chat stream's events: chunks, the error event as
+    /// the terminal's error object (`code`, else `type`, else `server_error`;
+    /// `message`, else the generic wording), the terminator, and every other
+    /// data event left to the caller; lines that are not data events are
+    /// nobody's.
+    #[test]
+    fn the_chat_sse_reader_sorts_a_frames_events() {
+        let frame = concat!(
+            ": keep-alive\n\n",
+            "data: {\"id\":\"chat_test\",\"object\":\"chat.completion.chunk\",\"created\":0,\
+             \"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\
+             \"finish_reason\":null}]}\n\n",
+            "data: {\"unexpected\":true}\n\n",
+            "data: {\"error\":{\"type\":\"internal_error\",\"message\":\"engine unavailable\"}}\n\n",
+            "data: {\"error\":{\"code\":\"rate_limited\"}}\n\n",
+            "data: [DONE]\n\n",
+            "data: {\"after\":\"done\"}\n\n",
+        );
+        let read: Vec<String> = chat_sse_events(frame)
+            .map(|event| match event {
+                ChatSseEvent::Chunk(chunk) => format!(
+                    "chunk:{}",
+                    chunk.choices[0].delta.content.as_deref().unwrap_or("")
+                ),
+                ChatSseEvent::UpstreamError(error) => format!("error:{error}"),
+                ChatSseEvent::Done => "done".to_string(),
+                ChatSseEvent::Other(event) => format!("other:{event}"),
+            })
+            .collect();
+        assert_eq!(
+            read,
+            [
+                "chunk:hi",
+                "other:data: {\"unexpected\":true}",
+                "error:{\"code\":\"internal_error\",\"message\":\"engine unavailable\"}",
+                "error:{\"code\":\"rate_limited\",\"message\":\"Upstream generation failed\"}",
+                "done",
+                "other:data: {\"after\":\"done\"}",
+            ]
+        );
+    }
+
     /// One chat chunk as the SSE event the chat stream writes for it.
     fn chat_event(delta: Value, finish_reason: Option<&str>) -> String {
         format!(
@@ -1792,6 +1890,7 @@ mod tests {
             Arc::new(smg_data_connector::MemoryResponseStorage::new()),
             Arc::new(smg_data_connector::MemoryConversationStorage::new()),
             Arc::new(smg_data_connector::MemoryConversationItemStorage::new()),
+            None,
             None,
             tx,
         )

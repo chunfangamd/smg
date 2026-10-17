@@ -9,13 +9,14 @@ use axum::{
 use openai_protocol::{
     chat::ChatCompletionRequest,
     classify::ClassifyRequest,
+    common::Tool as ChatTool,
     completion::CompletionRequest,
     decisions::DecisionsRequest,
     embedding::EmbeddingRequest,
     generate::GenerateRequest,
     messages::{
         CountMessageTokensRequest, CountMessageTokensResponse, CreateMessageRequest, Message,
-        MessageDelta, MessageDeltaUsage, MessageStreamEvent, StopReason, Tool, ToolChoice, Usage,
+        MessageDelta, MessageDeltaUsage, MessageStreamEvent, StopReason, ToolChoice, Usage,
     },
     responses::ResponsesRequest,
     transcription::{AudioFile, TranscriptionRequest},
@@ -44,14 +45,14 @@ use super::{
         responses, stages::decisions::supports_worker as supports_decisions_worker,
         streaming::StreamingProcessor,
     },
-    utils::{message_utils, ParserResolver},
+    utils::{message_utils, missing_tokenizer_response, ParserResolver},
 };
 use crate::{
     app_context::AppContext,
     config::types::RetryConfig,
     middleware::TenantRequestMeta,
     observability::metrics::metrics_labels,
-    routers::{error, RouterTrait},
+    routers::{error, grpc::regular::symphony::template::Templates, RouterTrait},
     worker::{RoutingPool, WorkerRegistry, WorkerType},
 };
 
@@ -136,6 +137,10 @@ impl GrpcRouter {
                 ctx.configured_reasoning_parser.clone(),
             ),
             multimodal,
+            tokenizer_autoload: !ctx.router_config.disable_tokenizer_autoload,
+            tokenizer_load_failures: ctx.tokenizer_load_failures.clone(),
+            parser: ctx.router_config.parser,
+            templates: Arc::new(Templates::new(tokenizer_registry.clone())),
         });
 
         // The admission queue's timeout also bounds how long an accepted
@@ -532,13 +537,15 @@ impl GrpcRouter {
             &ctx.response_storage,
             &queued,
             &request,
+            crate::tenant::storage_tenant(tenant_meta).as_deref(),
             ctx.request_context.clone(),
         )
         .await
         {
-            return error::internal_error(
+            return error::storage_failure(
                 "store_response_failed",
-                format!("Failed to store the queued response: {e}"),
+                "Failed to store the queued response",
+                &e,
             );
         }
         debug!(response_id = %id, harmony = is_harmony, "Background response queued");
@@ -716,7 +723,7 @@ impl GrpcRouter {
             .count_prompt_tokens(
                 &model_id,
                 message_utils::MessagesPrompt::from(&body),
-                body.tools.as_deref(),
+                &body.chat_tools(),
                 body.tool_choice.as_ref(),
             )
             .await
@@ -731,30 +738,45 @@ impl GrpcRouter {
     }
 
     /// The prompt's token count, as `/v1/messages/count_tokens` reports it:
-    /// the registry's tokenizer for the model, the tools the template renders
-    /// and the request's media resolved as the preparation stage resolves
-    /// them; no worker takes part. The refusals are count_tokens': a model
-    /// nobody serves is the client's mistake (404), whatever a removed worker
-    /// left in the tokenizer registry; a served model with no tokenizer is a
-    /// gateway fault (500), as is a prompt that does not encode; a prompt
-    /// that does not render is a 400.
+    /// the registry's tokenizer for the model, the tools the template renders,
+    /// the request's media and the effort its `output_config` states (in
+    /// `other`, the request's untyped fields) resolved as the preparation
+    /// stage resolves them; no worker takes part. The refusals are
+    /// count_tokens': a model nobody serves is the client's mistake (404),
+    /// whatever a removed worker left in the tokenizer registry; a served
+    /// model whose tokenizer the gateway is still loading is not ready yet
+    /// (503 with a `Retry-After`); one whose tokenizer load was skipped or
+    /// failed for good will not get one on its own (503 without); a served
+    /// model with no tokenizer when the gateway does not load tokenizers
+    /// itself is a gateway fault (500), as is a prompt that does not encode;
+    /// a prompt that does not render is a 400.
     async fn count_prompt_tokens(
         &self,
         model_id: &str,
         prompt: message_utils::MessagesPrompt<'_>,
-        tools: Option<&[Tool]>,
+        chat_tools: &[ChatTool],
         tool_choice: Option<&ToolChoice>,
     ) -> Result<u32, Response> {
         if !self.worker_registry.contains_model(model_id) {
             return Err(error::model_not_found(model_id));
         }
         let Some(tokenizer) = self.shared_components.tokenizer_registry.get(model_id) else {
-            return Err(error::internal_error(
-                "tokenizer_not_found",
-                format!("Tokenizer not found for model: {model_id}"),
+            return Err(missing_tokenizer_response(
+                "GrpcRouter::count_prompt_tokens",
+                model_id,
+                true,
+                self.shared_components.tokenizer_autoload,
+                self.shared_components
+                    .tokenizer_load_failures
+                    .get(model_id)
+                    .as_ref(),
             ));
         };
-        let chat_tools = message_utils::template_tools(tools, tool_choice);
+        let tools = message_utils::template_tools(
+            chat_tools,
+            tool_choice,
+            tokenizer.renderer_capabilities(),
+        );
         let media = message_utils::resolve_messages_media(
             &self.shared_components,
             model_id,
@@ -765,7 +787,7 @@ impl GrpcRouter {
         message_utils::count_input_tokens(
             prompt,
             tokenizer,
-            &chat_tools,
+            &tools,
             media.placeholders(),
             media.media_order,
         )
@@ -808,7 +830,7 @@ impl GrpcRouter {
             .count_prompt_tokens(
                 model_id,
                 message_utils::MessagesPrompt::from(&*body),
-                body.tools.as_deref(),
+                &body.chat_tools(),
                 body.tool_choice.as_ref(),
             )
             .await
@@ -1061,11 +1083,17 @@ impl RouterTrait for GrpcRouter {
             .await
     }
 
-    async fn cancel_response(&self, _headers: Option<&HeaderMap>, response_id: &str) -> Response {
+    async fn cancel_response(
+        &self,
+        _headers: Option<&HeaderMap>,
+        tenant_meta: &TenantRequestMeta,
+        response_id: &str,
+    ) -> Response {
         let Some(responses_context) = self.responses_context.as_ref() else {
             return not_implemented("Cancel response not implemented");
         };
-        cancel_response_impl(responses_context, response_id).await
+        let tenant = crate::tenant::storage_tenant(tenant_meta);
+        cancel_response_impl(responses_context, tenant.as_deref(), response_id).await
     }
 
     async fn route_embeddings(
@@ -1194,9 +1222,14 @@ fn canonicalize_responses_request<'a>(
 
 #[cfg(test)]
 mod pd_tests {
-    use std::sync::{Arc, OnceLock};
+    use std::{
+        fs,
+        sync::{Arc, OnceLock},
+        time::{Duration, Instant},
+    };
 
-    use llm_tokenizer::registry::TokenizerRegistry;
+    use http::header::RETRY_AFTER;
+    use llm_tokenizer::{factory, registry::TokenizerRegistry};
     use openai_protocol::{model_card::ModelCard, worker::HealthCheckConfig};
     use reasoning_parser::ParserFactory as ReasoningParserFactory;
     use serde_json::json;
@@ -1205,13 +1238,19 @@ mod pd_tests {
     };
     use smg_mcp::{McpConfig, McpOrchestrator};
     use tool_parser::ParserFactory as ToolParserFactory;
+    use wfaas::{StepExecutor, WorkflowContext, WorkflowInstanceId};
 
     use super::*;
     use crate::{
         config::{PolicyConfig, RouterConfig, RoutingMode},
         policies::PolicyRegistry,
         tenant::TenantKey,
-        worker::{BasicWorkerBuilder, ConnectionMode, WorkerRegistry},
+        worker::{BasicWorker, BasicWorkerBuilder, ConnectionMode, WorkerRegistry},
+        workflow::{
+            create_worker_workflow_data, steps::local::SubmitTokenizerJobStep, JobQueue,
+            JobQueueConfig, TokenizerLoadFailure, WorkerKind, WorkerRegistrationMode, WorkerSpec,
+            WorkerWorkflowData, WorkflowEngines,
+        },
     };
 
     fn regular_routing_mode() -> RoutingMode {
@@ -1372,6 +1411,294 @@ mod pd_tests {
             error::extract_error_code_from_response(&response),
             "model_not_found"
         );
+    }
+
+    /// A served model whose tokenizer the gateway has not registered yet
+    /// (the window after its worker turned healthy) is not ready: a
+    /// retryable 503 with a `Retry-After`, not a 500.
+    #[tokio::test]
+    async fn count_tokens_answers_not_ready_while_a_served_models_tokenizer_loads() {
+        let ctx = grpc_ctx(regular_routing_mode()).await;
+        let worker = BasicWorkerBuilder::new("grpc://worker:30000")
+            .worker_type(WorkerType::Regular)
+            .connection_mode(ConnectionMode::Grpc)
+            .model(ModelCard::new("m"))
+            .health_config(HealthCheckConfig {
+                disable_health_check: true,
+                ..Default::default()
+            })
+            .build();
+        ctx.worker_registry
+            .register(Arc::new(worker))
+            .expect("register worker");
+        let router = GrpcRouter::new(&ctx, Mode::Regular).expect("regular router");
+        let tenant_meta = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+
+        let response = router
+            .route_messages_count_tokens(None, &tenant_meta, count_request("m"), "m")
+            .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            "tokenizer_not_ready"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
+    }
+
+    /// A local gRPC worker of model `m`, as the pipeline tests register it.
+    fn grpc_worker_for_m() -> Arc<BasicWorker> {
+        Arc::new(
+            BasicWorkerBuilder::new("grpc://worker:30000")
+                .worker_type(WorkerType::Regular)
+                .connection_mode(ConnectionMode::Grpc)
+                .model(ModelCard::new("m"))
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                })
+                .build(),
+        )
+    }
+
+    /// The tokenizer-registration step's input for a local gRPC worker with
+    /// these labels, as the worker registration workflow hands it over.
+    fn tokenizer_step_input(
+        ctx: &Arc<AppContext>,
+        worker: &Arc<BasicWorker>,
+        labels: &[(&str, &str)],
+    ) -> WorkflowContext<WorkerWorkflowData> {
+        let mut data = create_worker_workflow_data(
+            WorkerSpec::new("grpc://worker:30000"),
+            WorkerRegistrationMode::Upsert,
+            ctx.clone(),
+        );
+        data.worker_kind = Some(WorkerKind::Local);
+        data.connection_mode = Some(ConnectionMode::Grpc);
+        data.actual_workers = Some(vec![worker.clone()]);
+        data.final_labels = labels
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect();
+        WorkflowContext::new(WorkflowInstanceId::new(), data)
+    }
+
+    /// A served model whose worker registered without a tokenizer path (and
+    /// none in the router configuration) gets no tokenizer from the autoload,
+    /// ever: its requests are answered a 503 of its own code without a
+    /// `Retry-After`, not the not-ready 503 of a load in flight.
+    #[tokio::test]
+    async fn count_tokens_answers_load_failed_without_retry_after_for_a_worker_without_a_tokenizer_path(
+    ) {
+        let ctx = grpc_ctx(regular_routing_mode()).await;
+        ctx.worker_job_queue
+            .set(JobQueue::new(
+                JobQueueConfig::default(),
+                Arc::downgrade(&ctx),
+            ))
+            .ok();
+        let worker = grpc_worker_for_m();
+        ctx.worker_registry
+            .register(worker.clone())
+            .expect("register worker");
+        let router = GrpcRouter::new(&ctx, Mode::Regular).expect("regular router");
+        let tenant_meta = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+
+        let mut step = tokenizer_step_input(&ctx, &worker, &[]);
+        SubmitTokenizerJobStep
+            .execute(&mut step)
+            .await
+            .expect("the step runs");
+
+        let response = router
+            .route_messages_count_tokens(None, &tenant_meta, count_request("m"), "m")
+            .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            "tokenizer_load_failed"
+        );
+        assert!(
+            response.headers().get(RETRY_AFTER).is_none(),
+            "a retry changes nothing until a tokenizer registers"
+        );
+    }
+
+    /// A one-token tokenizer (`hello`), enough for a count.
+    const MINIMAL_TOKENIZER_JSON: &str = r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":{"type":"Whitespace"},"post_processor":null,"decoder":null,"model":{"type":"BPE","vocab":{"hello":0},"merges":[]}}"#;
+
+    /// A tokenizer registered after a failed load clears the failure: here a
+    /// worker re-registering with a usable path (an operator's
+    /// `POST /v1/tokenizers` takes the same job), after which the model
+    /// answers again.
+    #[tokio::test]
+    async fn a_tokenizer_registered_after_a_failed_load_clears_the_failure() {
+        let ctx = grpc_ctx(regular_routing_mode()).await;
+        ctx.worker_job_queue
+            .set(JobQueue::new(
+                JobQueueConfig::default(),
+                Arc::downgrade(&ctx),
+            ))
+            .ok();
+        ctx.workflow_engines
+            .set(WorkflowEngines::new(&ctx.router_config))
+            .ok();
+        let worker = grpc_worker_for_m();
+        ctx.worker_registry
+            .register(worker.clone())
+            .expect("register worker");
+        let router = GrpcRouter::new(&ctx, Mode::Regular).expect("regular router");
+        let tenant_meta = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+        assert!(ctx.tokenizer_load_failures.record(
+            "m",
+            TokenizerLoadFailure::Failed(
+                "Workflow failed at step load_tokenizer: boom".to_string()
+            )
+        ));
+
+        let response = router
+            .route_messages_count_tokens(None, &tenant_meta, count_request("m"), "m")
+            .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            "tokenizer_load_failed"
+        );
+        assert!(response.headers().get(RETRY_AFTER).is_none());
+
+        // The worker registers again, this time with a tokenizer to load.
+        let tokenizer_dir = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            tokenizer_dir.path().join("tokenizer.json"),
+            MINIMAL_TOKENIZER_JSON,
+        )
+        .expect("tokenizer.json");
+        fs::write(
+            tokenizer_dir.path().join("tokenizer_config.json"),
+            r#"{"chat_template": "hello"}"#,
+        )
+        .expect("tokenizer_config.json");
+        let path = tokenizer_dir.path().to_str().expect("utf-8 path");
+        let mut step = tokenizer_step_input(&ctx, &worker, &[("tokenizer_path", path)]);
+        SubmitTokenizerJobStep
+            .execute(&mut step)
+            .await
+            .expect("the step runs");
+        // Submitted: the model is pending again, not failed.
+        assert_eq!(ctx.tokenizer_load_failures.get("m"), None);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ctx.tokenizer_registry.contains("m") {
+            assert!(Instant::now() < deadline, "the tokenizer did not register");
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        let response = router
+            .route_messages_count_tokens(None, &tenant_meta, count_request("m"), "m")
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(ctx.tokenizer_load_failures.get("m"), None);
+    }
+
+    /// Two registrations of one model: while worker A's tokenizer load is in
+    /// flight (held here on the registry's per-name lock), worker B
+    /// registering without a path does not turn the model's answer into a
+    /// final failure; the model stays not ready with its retry hint, and
+    /// answers once A's load ends.
+    #[tokio::test]
+    async fn a_registration_without_a_path_defers_to_the_models_load_in_flight() {
+        let ctx = grpc_ctx(regular_routing_mode()).await;
+        ctx.worker_job_queue
+            .set(JobQueue::new(
+                JobQueueConfig::default(),
+                Arc::downgrade(&ctx),
+            ))
+            .ok();
+        ctx.workflow_engines
+            .set(WorkflowEngines::new(&ctx.router_config))
+            .ok();
+        let worker = grpc_worker_for_m();
+        ctx.worker_registry
+            .register(worker.clone())
+            .expect("register worker");
+        let router = GrpcRouter::new(&ctx, Mode::Regular).expect("regular router");
+        let tenant_meta = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+        let tokenizer_dir = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            tokenizer_dir.path().join("tokenizer.json"),
+            MINIMAL_TOKENIZER_JSON,
+        )
+        .expect("tokenizer.json");
+        fs::write(
+            tokenizer_dir.path().join("tokenizer_config.json"),
+            r#"{"chat_template": "hello"}"#,
+        )
+        .expect("tokenizer_config.json");
+        let path = tokenizer_dir
+            .path()
+            .to_str()
+            .expect("utf-8 path")
+            .to_string();
+
+        // A load of `m` held on the registry's per-name lock for 1.5 s: worker
+        // A's job, submitted next, waits behind it; worker B registers without
+        // a path meanwhile.
+        let held_path = path.clone();
+        let held = ctx
+            .tokenizer_registry
+            .load("held", "m", &path, move || async move {
+                tokio::time::sleep(Duration::from_millis(1500)).await;
+                factory::create_tokenizer_with_chat_template(&held_path, None)
+                    .map_err(|e| e.to_string())
+            });
+        let registrations = async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let mut step = tokenizer_step_input(&ctx, &worker, &[("tokenizer_path", &path)]);
+            SubmitTokenizerJobStep
+                .execute(&mut step)
+                .await
+                .expect("the step runs");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let mut step = tokenizer_step_input(&ctx, &worker, &[]);
+            SubmitTokenizerJobStep
+                .execute(&mut step)
+                .await
+                .expect("the step runs");
+            router
+                .route_messages_count_tokens(None, &tenant_meta, count_request("m"), "m")
+                .await
+        };
+        let (held, response) = tokio::join!(held, registrations);
+        held.expect("the held load succeeds");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            "tokenizer_not_ready",
+            "a load in flight keeps the retry hint"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let response = router
+                .route_messages_count_tokens(None, &tenant_meta, count_request("m"), "m")
+                .await;
+            if response.status() == StatusCode::OK {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the model did not answer");
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
     }
 
     fn message_request(body: serde_json::Value) -> CreateMessageRequest {
@@ -1544,6 +1871,91 @@ mod pd_tests {
         );
     }
 
+    /// count_tokens and `max_tokens: 0` render `output_config.effort` as
+    /// `/v1/messages` renders it, as the `reasoning_effort` template kwarg:
+    /// the count is that of the prompt with the effort, and an effort of
+    /// another type is a 400 `invalid_type`.
+    #[tokio::test]
+    async fn counts_render_the_output_config_effort() {
+        use llm_tokenizer::traits::Tokenizer as _;
+
+        let ctx = grpc_ctx(regular_routing_mode()).await;
+        let mut tokenizer =
+            llm_tokenizer::TiktokenTokenizer::new(llm_tokenizer::TiktokenModel::Cl100kBase)
+                .expect("tokenizer");
+        tokenizer
+            .set_chat_template(
+                "{%- for m in messages -%}{{ m.role }}: {{ m.content }} {% endfor -%}\
+                 effort={{ reasoning_effort | default('') }}"
+                    .to_string(),
+            )
+            .expect("template");
+        let tokenizer: Arc<dyn llm_tokenizer::traits::Tokenizer> = Arc::new(tokenizer);
+        let tokens = |text: &str| {
+            tokenizer
+                .encode(text, false)
+                .expect("encode")
+                .token_ids()
+                .len()
+        };
+        let (unset, high) = (tokens("user: hi effort="), tokens("user: hi effort=high"));
+        assert_ne!(unset, high);
+        let registered = Arc::clone(&tokenizer);
+        ctx.tokenizer_registry
+            .load("m", "m", "mock", || async move { Ok(registered) })
+            .await
+            .expect("register the tokenizer");
+        let worker = BasicWorkerBuilder::new("grpc://worker:30000")
+            .worker_type(WorkerType::Regular)
+            .connection_mode(ConnectionMode::Grpc)
+            .model(ModelCard::new("m"))
+            .health_config(HealthCheckConfig {
+                disable_health_check: true,
+                ..Default::default()
+            })
+            .build();
+        ctx.worker_registry
+            .register(Arc::new(worker))
+            .expect("register worker");
+        let router = GrpcRouter::new(&ctx, Mode::Regular).expect("regular router");
+        let tenant_meta = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+
+        for (output_config, input_tokens) in [
+            (json!({"effort": "high"}), high),
+            (json!({"effort": null}), unset),
+        ] {
+            let body = json!({
+                "model": "m", "output_config": output_config,
+                "messages": [{"role": "user", "content": "hi"}]
+            });
+            let count = router
+                .route_messages_count_tokens(
+                    None,
+                    &tenant_meta,
+                    serde_json::from_value(body.clone()).expect("count request"),
+                    "m",
+                )
+                .await;
+            let mut message = body;
+            message["max_tokens"] = json!(0);
+            let empty = router
+                .route_messages(None, &tenant_meta, message_request(message), "m")
+                .await;
+            for (response, field) in [(count, "/input_tokens"), (empty, "/usage/input_tokens")] {
+                assert_eq!(response.status(), StatusCode::OK, "{output_config}");
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .expect("body");
+                let json: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+                assert_eq!(
+                    json.pointer(field),
+                    Some(&json!(input_tokens)),
+                    "{output_config}"
+                );
+            }
+        }
+    }
+
     /// PD-mode completion must honor a per-model retry override, not the router
     /// default.
     #[tokio::test]
@@ -1631,7 +2043,9 @@ mod pd_tests {
             .await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
-        let cancel = router.cancel_response(None, "resp_missing").await;
+        let cancel = router
+            .cancel_response(None, &tenant_meta, "resp_missing")
+            .await;
         assert_eq!(cancel.status(), StatusCode::NOT_FOUND);
     }
 
@@ -1648,7 +2062,9 @@ mod pd_tests {
             .await;
         assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
 
-        let cancel = router.cancel_response(None, "resp_missing").await;
+        let cancel = router
+            .cancel_response(None, &tenant_meta, "resp_missing")
+            .await;
         assert_eq!(cancel.status(), StatusCode::NOT_IMPLEMENTED);
     }
 

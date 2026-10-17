@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import multiprocessing
 import os
 import signal
@@ -105,16 +107,40 @@ def _alive(pid: int) -> bool:
         return False  # reaped: before the open (ENOENT), or between it and the read (ESRCH)
 
 
-def _worker_pid(pid_file, deadline_secs: float = 10) -> int:
-    deadline = time.monotonic() + deadline_secs
-    while not pid_file.exists() or not pid_file.read_text().strip():
+# Every wait below is a poll that ends at its event; the bound only catches a
+# hang, so it is generous: a spawn or an exit that is slow on a loaded host
+# must not fail a test whose behaviour is unaffected.
+_PATIENCE_SECS = 60.0
+
+
+def _worker_pid(pid_file, launcher: subprocess.Popen) -> int:
+    """The pid the launcher wrote once it spawned its worker; a launcher that
+    exits before that fails the test at once instead of at the bound."""
+    deadline = time.monotonic() + _PATIENCE_SECS
+    while True:
+        # Polled before the read: an exit seen here wrote all it would, so a
+        # launcher that writes its pid and exits between the two is not
+        # reported as one that never spawned its worker.
+        code = launcher.poll()
+        if pid_file.exists() and pid_file.read_text().strip():
+            return int(pid_file.read_text())
+        assert code is None, f"the launcher exited with {code} before it spawned its worker"
         assert time.monotonic() < deadline, "the launcher never spawned its worker"
         time.sleep(0.05)
-    return int(pid_file.read_text())
 
 
-def _wait_dead(pid: int, what: str, deadline_secs: float = 10) -> None:
-    deadline = time.monotonic() + deadline_secs
+def _exit_when(go_file, code: int) -> str:
+    """The tail of a launcher's command: it exits with ``code`` once the test
+    creates ``go_file``, so the test says when a core goes, not a timer that a
+    loaded host can outrun. The wait ends on its own at the workers' 300 s
+    lifetime, so a test that fails before it creates the file (and every wait
+    in this file gives up at the patience bound, well before) leaves no
+    launcher polling for ever."""
+    return f"until [ -e {go_file} ] || (( SECONDS >= 300 )); do sleep 0.02; done; exit {code}"
+
+
+def _wait_dead(pid: int, what: str) -> None:
+    deadline = time.monotonic() + _PATIENCE_SECS
     while _alive(pid):
         assert time.monotonic() < deadline, f"the {what} outlived the engine cleanup"
         time.sleep(0.05)
@@ -125,28 +151,29 @@ def test_kill_reaches_the_workers_the_engine_spawned(tmp_path):
     everything stays in the launcher's process group."""
     pid_file = tmp_path / "worker.pid"
     launcher = subprocess.Popen(["bash", "-c", f"sleep 300 & echo $! > {pid_file}; wait"])
-    worker_pid = _worker_pid(pid_file)
+    worker_pid = _worker_pid(pid_file, launcher)
     engine = rust_lifecycle.EngineProcess(_PopenAsSpawned(launcher))
     assert os.getpgid(launcher.pid) == os.getpgid(0)
     assert engine.poll() is None  # tracks the worker
 
     engine.kill()
 
-    assert engine.wait(timeout=10) == -signal.SIGKILL
+    assert engine.wait(timeout=_PATIENCE_SECS) == -signal.SIGKILL
     _wait_dead(worker_pid, "worker")
 
 
 def test_cleanup_after_the_engine_exited_kills_the_workers_it_left(tmp_path):
     """An engine that crashed leaves re-parented workers; terminate_engine
     kills the ones it had seen while the engine was alive."""
-    pid_file = tmp_path / "worker.pid"
+    pid_file, go = tmp_path / "worker.pid", tmp_path / "go"
     launcher = subprocess.Popen(
-        ["bash", "-c", f"sleep 300 & echo $! > {pid_file}; sleep 2; exit 3"]
+        ["bash", "-c", f"sleep 300 & echo $! > {pid_file}; {_exit_when(go, 3)}"]
     )
-    worker_pid = _worker_pid(pid_file)
+    worker_pid = _worker_pid(pid_file, launcher)
     engine = rust_lifecycle.EngineProcess(_PopenAsSpawned(launcher))
     assert engine.poll() is None  # tracks the worker while the launcher lives
-    assert engine.wait(timeout=10) == 3
+    go.touch()
+    assert engine.wait(timeout=_PATIENCE_SECS) == 3
     assert _alive(worker_pid)
 
     rust_lifecycle.terminate_engine(engine)
@@ -188,14 +215,14 @@ def test_group_kill_reaches_the_workers_of_every_core(tmp_path):
         subprocess.Popen(["bash", "-c", f"sleep 300 & echo $! > {pid_file}; wait"])
         for pid_file in pid_files
     ]
-    workers = [_worker_pid(pid_file) for pid_file in pid_files]
+    workers = [_worker_pid(pid_file, launcher) for pid_file, launcher in zip(pid_files, launchers)]
     engines = rust_lifecycle.EngineProcessGroup(_ManagerOf(launchers))
     assert engines.pids == [launcher.pid for launcher in launchers]
     assert engines.poll() is None  # tracks every core's workers
 
     engines.kill()
 
-    assert engines.wait(timeout=10) == -signal.SIGKILL
+    assert engines.wait(timeout=_PATIENCE_SECS) == -signal.SIGKILL
     for worker in workers:
         _wait_dead(worker, "worker")
 
@@ -203,21 +230,25 @@ def test_group_kill_reaches_the_workers_of_every_core(tmp_path):
 def test_one_cores_exit_ends_the_group_and_the_cleanup_reaps_every_worker(tmp_path):
     """A core that exits takes the engine down: the manager shuts the other
     cores down and `terminate_engine` kills the workers they left."""
-    pid_files = [tmp_path / "a.pid", tmp_path / "b.pid"]
+    pid_files, go = [tmp_path / "a.pid", tmp_path / "b.pid"], tmp_path / "go"
     launchers = [
-        subprocess.Popen(["bash", "-c", f"sleep 300 & echo $! > {pid_files[0]}; sleep 1; exit 3"]),
+        subprocess.Popen(
+            ["bash", "-c", f"sleep 300 & echo $! > {pid_files[0]}; {_exit_when(go, 3)}"]
+        ),
         subprocess.Popen(["bash", "-c", f"sleep 300 & echo $! > {pid_files[1]}; wait"]),
     ]
-    workers = [_worker_pid(pid_file) for pid_file in pid_files]
+    workers = [_worker_pid(pid_file, launcher) for pid_file, launcher in zip(pid_files, launchers)]
     manager = _ManagerOf(launchers)
     engines = rust_lifecycle.EngineProcessGroup(manager)
     assert engines.poll() is None
-    deadline = time.monotonic() + 10
+    go.touch()
+    deadline = time.monotonic() + _PATIENCE_SECS
     while engines.poll() is None:
         assert time.monotonic() < deadline, "the first core never exited"
         time.sleep(0.05)
     assert engines.poll() == 3 and manager.shutdowns == [None]
-    assert engines.wait(timeout=10) == 3  # the first exit code; the sibling was terminated
+    # The first exit code; the sibling was terminated.
+    assert engines.wait(timeout=_PATIENCE_SECS) == 3
 
     rust_lifecycle.terminate_engine(engines)
 
@@ -462,3 +493,298 @@ def test_ensure_spawn_start_method_forces_spawn_only_when_it_is_not_set(monkeypa
     assert "test scheduler: the multiprocessing start method was not spawn; setting it" in (
         caplog.text
     )
+
+
+# ── the launcher knobs (smg-lab #292) ──────────────────────────────────────────
+
+
+def test_env_float_names_the_variable_on_a_value_it_cannot_use():
+    ConfigError = rust_lifecycle.ServicerConfigError
+    assert rust_lifecycle.env_float("X_DRAIN", 5.0, environ={}) == 5.0
+    assert rust_lifecycle.env_float("X_DRAIN", 5.0, environ={"X_DRAIN": " "}) == 5.0
+    assert rust_lifecycle.env_float("X_DRAIN", 5.0, environ={"X_DRAIN": "2.5"}) == 2.5
+    with pytest.raises(ConfigError, match="X_DRAIN='abc' is not a number"):
+        rust_lifecycle.env_float("X_DRAIN", 5.0, environ={"X_DRAIN": "abc"})
+    with pytest.raises(ConfigError, match="X_DRAIN='-5' must be at least 0"):
+        rust_lifecycle.env_float("X_DRAIN", 5.0, environ={"X_DRAIN": "-5"}, minimum=0.0)
+    with pytest.raises(ConfigError, match="X_START='-1' must be greater than 0"):
+        rust_lifecycle.env_float("X_START", 1.0, environ={"X_START": "-1"}, positive=True)
+    with pytest.raises(ConfigError, match="X_START='nan' is not a finite number"):
+        rust_lifecycle.env_float("X_START", 1.0, environ={"X_START": "nan"})
+    assert issubclass(ConfigError, ValueError)
+
+
+def test_env_port_takes_a_port_or_none_and_refuses_the_rest():
+    ConfigError = rust_lifecycle.ServicerConfigError
+    assert rust_lifecycle.env_port("X_PORT", environ={}) is None
+    assert rust_lifecycle.env_port("X_PORT", environ={"X_PORT": "0"}) is None
+    assert rust_lifecycle.env_port("X_PORT", environ={"X_PORT": "24321"}) == 24321
+    with pytest.raises(ConfigError, match="X_PORT='abc' is not a port number"):
+        rust_lifecycle.env_port("X_PORT", environ={"X_PORT": "abc"})
+    with pytest.raises(ConfigError, match="X_PORT='70000' must be between 1 and 65535"):
+        rust_lifecycle.env_port("X_PORT", environ={"X_PORT": "70000"})
+
+
+def test_prepare_socket_dir_creates_the_directory_and_refuses_a_file(tmp_path):
+    ConfigError = rust_lifecycle.ServicerConfigError
+    created = rust_lifecycle.prepare_socket_dir(str(tmp_path / "sockets"))
+    assert os.path.isdir(created) and (os.stat(created).st_mode & 0o777) == 0o700
+    assert rust_lifecycle.prepare_socket_dir(created) == created
+    a_file = tmp_path / "a-file"
+    a_file.write_text("not a directory")
+    with pytest.raises(ConfigError, match="SMG_ZMQ_SOCKET_DIR=.*exists and is not a directory"):
+        rust_lifecycle.prepare_socket_dir(str(a_file))
+    with pytest.raises(ConfigError, match="SMG_ZMQ_SOCKET_DIR=.*cannot be created"):
+        rust_lifecycle.prepare_socket_dir(str(a_file / "below"))
+
+
+def test_read_launcher_knobs_reads_every_knob_once_with_its_default(tmp_path):
+    names = dict(
+        handshake_port_env="X_HS",
+        drain_secs_env="X_DRAIN",
+        startup_timeout_secs_env="X_START",
+        startup_ceiling_secs_env="X_CEIL",
+    )
+    socket_dir = {"SMG_ZMQ_SOCKET_DIR": str(tmp_path / "sockets")}
+    knobs = rust_lifecycle.read_launcher_knobs(**names, environ=socket_dir)
+    assert knobs == rust_lifecycle.LauncherKnobs(
+        handshake_port=None,
+        drain_secs=rust_lifecycle.DEFAULT_DRAIN_SECS,
+        startup_timeout_secs=rust_lifecycle.DEFAULT_STARTUP_TIMEOUT_SECS,
+        startup_ceiling_secs=rust_lifecycle.DEFAULT_STARTUP_CEILING_SECS,
+        socket_dir=str(tmp_path / "sockets"),
+    )
+    assert os.path.isdir(tmp_path / "sockets")
+    knobs = rust_lifecycle.read_launcher_knobs(
+        **names,
+        socket_dir=str(tmp_path / "given"),
+        environ={"X_HS": "24321", "X_DRAIN": "0", "X_START": "42", "X_CEIL": "0", **socket_dir},
+    )
+    assert (knobs.handshake_port, knobs.drain_secs) == (24321, 0.0)
+    assert (knobs.startup_timeout_secs, knobs.startup_ceiling_secs) == (42.0, 0.0)
+    assert knobs.socket_dir == str(tmp_path / "given") and os.path.isdir(knobs.socket_dir)
+    for name, value, text in [
+        ("X_HS", "70000", "must be between 1 and 65535"),
+        ("X_HS", "abc", "is not a port number"),
+        ("X_DRAIN", "-5", "must be at least 0"),
+        ("X_DRAIN", "abc", "is not a number"),
+        ("X_START", "abc", "is not a number"),
+        ("X_START", "-1", "must be greater than 0"),
+        ("X_CEIL", "-1", "must be at least 0"),
+    ]:
+        with pytest.raises(rust_lifecycle.ServicerConfigError, match=f"{name}='{value}' {text}"):
+            rust_lifecycle.read_launcher_knobs(**names, environ={name: value, **socket_dir})
+
+
+def test_configuration_exit_is_one_error_line_and_exit_code_2(caplog):
+    caplog.set_level(logging.ERROR)
+    error = rust_lifecycle.ServicerConfigError("X_DRAIN='abc' is not a number")
+    exit_ = rust_lifecycle.configuration_exit(error)
+    assert isinstance(exit_, SystemExit)
+    assert exit_.code == rust_lifecycle.CONFIG_ERROR_EXIT_CODE == 2
+    assert "servicer configuration error: X_DRAIN='abc' is not a number" in caplog.text
+
+
+def test_guarded_exit_ends_a_hung_shutdown_after_the_grace(monkeypatch):
+    """The exit over a dead engine is a normal SystemExit first; a shutdown
+    that hangs past the grace is ended by the guard with the same code."""
+    ended = threading.Event()
+    codes: list[int] = []
+
+    def end_process(code: int, grace_secs: float) -> None:
+        codes.append(code)
+        assert grace_secs == 0.05
+        ended.set()
+
+    monkeypatch.setattr(rust_lifecycle, "_end_process", end_process)
+    exit_ = rust_lifecycle.guarded_exit(1, grace_secs=0.05)
+    assert isinstance(exit_, SystemExit) and exit_.code == 1
+    assert ended.wait(5.0) and codes == [1]
+    # The guard is a daemon timer: it never keeps a finished interpreter alive.
+    guard = [t for t in threading.enumerate() if isinstance(t, threading.Timer)]
+    assert all(t.daemon for t in guard)
+
+
+def test_the_guard_says_it_fired_and_terminates_the_children(monkeypatch, caplog):
+    """When the guard ends the process it says so, dumps every thread's stack
+    (the cause of the hang, for the next reader) and terminates the children
+    the interpreter's own exit would have joined, before ending the process."""
+    terminated: list[int] = []
+    child = types.SimpleNamespace(pid=4242, terminate=lambda: terminated.append(4242))
+    monkeypatch.setattr(rust_lifecycle.multiprocessing, "active_children", lambda: [child])
+    dumped: list[bool] = []
+    monkeypatch.setattr(
+        rust_lifecycle.faulthandler,
+        "dump_traceback",
+        lambda all_threads=False: dumped.append(all_threads),
+    )
+    ended: list[int] = []
+    monkeypatch.setattr(rust_lifecycle.os, "_exit", ended.append)
+    caplog.set_level(logging.ERROR)
+    rust_lifecycle._end_process(1, 15.0)
+    assert "did not finish within 15 s; ending the process with code 1" in caplog.text
+    assert dumped == [True] and terminated == [4242] and ended == [1]
+
+
+def test_the_guard_ends_the_process_even_when_its_report_fails(monkeypatch):
+    """The exit is the last resort: a stack dump that raises (a closed stderr)
+    or a child that cannot be terminated never keeps the process alive."""
+
+    def failing_dump(all_threads=False):
+        raise RuntimeError("sys.stderr is None")
+
+    monkeypatch.setattr(rust_lifecycle.faulthandler, "dump_traceback", failing_dump)
+    child = types.SimpleNamespace(
+        pid=4242, terminate=lambda: (_ for _ in ()).throw(OSError("gone"))
+    )
+    monkeypatch.setattr(rust_lifecycle.multiprocessing, "active_children", lambda: [child])
+    ended: list[int] = []
+    monkeypatch.setattr(rust_lifecycle.os, "_exit", ended.append)
+    rust_lifecycle._end_process(1, 15.0)
+    assert ended == [1]
+
+
+def test_launch_or_stop_stops_the_server_only_when_the_launch_raises():
+    events: list[str] = []
+
+    class Server:
+        def set_serving(self, serving: bool) -> None:
+            events.append(f"serving:{serving}")
+
+        def stop(self, timeout: float) -> None:
+            events.append(f"stop:{timeout}")
+
+    server = Server()
+    assert asyncio.run(rust_lifecycle.launch_or_stop(server, lambda: "engine")) == "engine"
+    assert events == []
+
+    def failing_launch():
+        raise RuntimeError("engine would not start")
+
+    with pytest.raises(RuntimeError, match="engine would not start"):
+        asyncio.run(rust_lifecycle.launch_or_stop(server, failing_launch))
+    assert events == ["serving:False", f"stop:{rust_lifecycle.SERVER_STOP_SECS}"]
+
+
+def test_launch_or_stop_reports_the_launch_error_when_the_stop_itself_fails(caplog):
+    """The stop after a failed launch is best effort, step by step: a server
+    that cannot flip its health is still stopped, a server that cannot stop
+    is logged, and the launch error is the one that propagates (the entry
+    point's exit code depends on its type)."""
+    events: list[str] = []
+
+    class Server:
+        def __init__(self, *, serving_fails: bool, stop_fails: bool):
+            self.serving_fails = serving_fails
+            self.stop_fails = stop_fails
+
+        def set_serving(self, serving: bool) -> None:
+            events.append(f"serving:{serving}")
+            if self.serving_fails:
+                raise RuntimeError("health flip failed")
+
+        def stop(self, timeout: float) -> None:
+            events.append(f"stop:{timeout}")
+            if self.stop_fails:
+                raise RuntimeError("stop failed")
+
+    def failing_launch():
+        raise ValueError("engine would not start")
+
+    caplog.set_level(logging.ERROR)
+    for server in (
+        Server(serving_fails=True, stop_fails=False),
+        Server(serving_fails=False, stop_fails=True),
+        Server(serving_fails=True, stop_fails=True),
+    ):
+        events.clear()
+        with pytest.raises(ValueError, match="engine would not start"):
+            asyncio.run(rust_lifecycle.launch_or_stop(server, failing_launch))
+        assert events == ["serving:False", f"stop:{rust_lifecycle.SERVER_STOP_SECS}"]
+    assert "Failed to mark the servicer as not serving" in caplog.text
+    assert "Failed to stop the Rust servicer cleanly" in caplog.text
+
+
+def test_a_cancelled_launch_task_still_stops_the_server():
+    """The stop after a failed launch finishes even when the launch's own task
+    is cancelled meanwhile (the entry point's loop shutting down): the port
+    is released before the cancellation propagates."""
+    stop_entered = threading.Event()
+    stop_may_finish = threading.Event()
+    events: list[str] = []
+
+    class Server:
+        def set_serving(self, serving: bool) -> None:
+            events.append(f"serving:{serving}")
+
+        def stop(self, timeout: float) -> None:
+            stop_entered.set()
+            stop_may_finish.wait(5)
+            events.append(f"stop:{timeout}")
+
+    def failing_launch():
+        raise RuntimeError("engine would not start")
+
+    async def run():
+        task = asyncio.create_task(rust_lifecycle.launch_or_stop(Server(), failing_launch))
+        await asyncio.to_thread(stop_entered.wait, 5)
+        task.cancel()
+        stop_may_finish.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        events.append("cancelled")
+
+    asyncio.run(run())
+    assert events == ["serving:False", f"stop:{rust_lifecycle.SERVER_STOP_SECS}", "cancelled"]
+
+
+def test_the_kv_events_default_turns_the_publisher_on_unless_told_otherwise(caplog):
+    """The rule the three launchers share: a target without a configuration
+    gets the engine's default, the engine's variable keeps the publisher off,
+    an explicit configuration is kept as given, frozen server args are left
+    alone."""
+    apply = rust_lifecycle.apply_kv_events_default
+    env = "SMG_TEST_SERVICER_KV_EVENTS"
+    built: list[str] = []
+
+    def build():
+        built.append("built")
+        return {"publisher": "zmq"}
+
+    # Nothing given (no attribute, None, an empty string): the default, as a
+    # value or built on demand.
+    target = types.SimpleNamespace()
+    assert apply(target, "zmq", env_name=env, environ={}) == "zmq"
+    assert target.kv_events_config == "zmq"
+    for target in (
+        types.SimpleNamespace(),
+        types.SimpleNamespace(kv_events_config=None),
+        types.SimpleNamespace(kv_events_config=""),
+    ):
+        assert apply(target, build, env_name=env, environ={}) == {"publisher": "zmq"}
+        assert target.kv_events_config == {"publisher": "zmq"}
+    assert built == ["built"] * 3
+    # The opt-out: the engine's variable, case and whitespace aside; nothing is
+    # built for a publisher left off. Any other value is not the opt-out.
+    for value in ("0", "false", "No", " off "):
+        target = types.SimpleNamespace(kv_events_config=None)
+        assert apply(target, build, env_name=env, environ={env: value}) is None
+        assert target.kv_events_config is None
+    assert apply(types.SimpleNamespace(), "zmq", env_name=env, environ={env: "1"}) == "zmq"
+    assert built == ["built"] * 3
+    # An explicit configuration is kept as given, off and empty included.
+    for given in ('{"publisher": "null"}', {}, types.SimpleNamespace(publisher="null")):
+        target = types.SimpleNamespace(kv_events_config=given)
+        assert apply(target, build, env_name=env, environ={}) is None
+        assert target.kv_events_config is given
+    assert built == ["built"] * 3
+    # Server args that cannot be written are left alone, with a warning.
+
+    class Frozen:
+        __slots__ = ()
+        kv_events_config = None
+
+    with caplog.at_level("WARNING", logger=rust_lifecycle.logger.name):
+        assert apply(Frozen(), "zmq", env_name=env, environ={}) is None
+    warning = "kv_events_config cannot be set on Frozen; KV event publishing stays as configured"
+    assert warning in caplog.text

@@ -536,8 +536,12 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
         labels
             .get("max_num_seqs")
             .or_else(|| labels.get("max_running_requests"))
-            .and_then(|s| s.parse::<u16>().ok())
+            .and_then(|s| s.parse::<u64>().ok())
             .filter(|n| *n > 0)
+            // A figure wider than the count (an explicit flag above 65535 on
+            // a large engine) saturates: a window that wide is the widest the
+            // gate and the capacity sum can use, not no window at all.
+            .map(|n| u16::try_from(n).unwrap_or(u16::MAX))
     }
 
     /// Whether this worker can serve the Realtime API (WS/WebRTC/REST
@@ -669,6 +673,30 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     fn tracked_load(&self) -> usize {
         0
     }
+    /// Record the first token or completion of a stream from this worker:
+    /// from here until its end the stream is one the worker is producing for.
+    fn note_output_started(&self) {}
+    /// Record the end of a stream that had produced output.
+    fn note_output_ended(&self) {}
+    /// How long the worker has produced nothing while it still holds streams
+    /// it had been producing for: `Some(age)` when at least one stream past
+    /// its first token or completion is open and the last token or
+    /// completion from the worker was `age` ago; `None` when no such stream
+    /// is open (an idle worker, one whose streams all ended, one whose
+    /// in-flight work has shown nothing yet: nothing to judge it by), or for
+    /// a worker that does not track it. The signal a disaggregated request
+    /// reads on its decode partner when its prefill leg's silence bound
+    /// passes on the parallel dispatch shape, where the prefill's first
+    /// response waits for the decode side. The age is that of the last
+    /// response the gateway read, not of the engine's last production: a
+    /// stream whose reader stops polling (a client that stays connected and
+    /// stops reading its bounded channel) keeps its open count and ages, so
+    /// a decode whose only open producing streams belong to such readers
+    /// can read as silent while a frozen prefill is the cause; the two
+    /// conditions together are the limit of this signal.
+    fn output_silence(&self) -> Option<Duration> {
+        None
+    }
 
     /// Store the engine's reported waiting-queue depth, returning the previous
     /// value.
@@ -758,6 +786,23 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// until one is). Zero for a worker that does not track it.
     fn prefill_backlog(&self) -> Duration {
         Duration::ZERO
+    }
+
+    /// [`Self::prefill_backlog`] with `tokens` more prompt tokens about to
+    /// be dispatched: how long the engine may need before the first token of
+    /// a prompt of that length is due, behind what is already pending. Zero
+    /// for a worker that does not track it.
+    fn prefill_eta(&self, _tokens: u64) -> Duration {
+        Duration::ZERO
+    }
+
+    /// How long ago a prompt dispatched to the worker was last answered with
+    /// its first token (or, for a non-streaming generation, its one answer):
+    /// the worker's latest first response, the evidence that it answers at
+    /// all. `None` for a worker that has answered none since the gateway
+    /// started, or does not track it.
+    fn prefill_answered_ago(&self) -> Option<Duration> {
+        None
     }
 
     /// One-shot routing snapshot for the per-request O(workers) selection loops:
@@ -1490,6 +1535,9 @@ pub struct WorkerRuntime {
     /// Requests in flight whose responses the gateway sees one by one (see
     /// [`Worker::tracked_load`]).
     tracked_in_flight: AtomicUsize,
+    /// Open streams that have produced a token or completion (see
+    /// [`Worker::output_silence`]).
+    producing_streams: AtomicUsize,
     /// The prefill book: pending prompt tokens, the busy interval and the
     /// rate window, moved together under one lock so a request's end and
     /// another's start cannot race the interval away (see [`PrefillBook`]).
@@ -1562,6 +1610,9 @@ struct PrefillBook {
     window_busy_ms: u64,
     /// First tokens' prompt tokens in the open window.
     window_tokens: u64,
+    /// Gateway clock of the latest first response (or one answer) to a
+    /// prompt dispatched here; zero until one.
+    last_answer_ms: u64,
 }
 
 impl PrefillBook {
@@ -1581,6 +1632,9 @@ impl PrefillBook {
 
     fn ended(&mut self, tokens: u64, timed: bool, cached: Option<u64>, now_ms: u64) {
         self.pending = self.pending.saturating_sub(tokens);
+        if cached.is_some() {
+            self.last_answer_ms = now_ms;
+        }
         if !timed {
             return;
         }
@@ -1638,15 +1692,25 @@ impl PrefillBook {
         }
     }
 
-    fn backlog(&self) -> Duration {
-        if self.pending == 0 {
+    /// The time to prefill what is pending plus `extra` tokens at the
+    /// observed rate (the cold prior until one is observed).
+    fn eta(&self, extra: u64) -> Duration {
+        let pending = self.pending.saturating_add(extra);
+        if pending == 0 {
             return Duration::ZERO;
         }
         let rate = match self.rate_tps {
             0 => COLD_PREFILL_TOKENS_PER_SEC,
             rate => rate,
         };
-        Duration::from_millis(self.pending.saturating_mul(1000) / rate)
+        Duration::from_millis(pending.saturating_mul(1000) / rate)
+    }
+
+    /// How long before `now_ms` the latest prompt was answered; `None`
+    /// until one has been.
+    fn answered_ago(&self, now_ms: u64) -> Option<Duration> {
+        (self.last_answer_ms > 0)
+            .then(|| Duration::from_millis(now_ms.saturating_sub(self.last_answer_ms)))
     }
 }
 
@@ -1736,6 +1800,7 @@ impl WorkerRuntime {
             divert_until_ms: AtomicU64::new(0),
             busy_since_ms: AtomicU64::new(0),
             tracked_in_flight: AtomicUsize::new(0),
+            producing_streams: AtomicUsize::new(0),
             prefill: Mutex::new(PrefillBook::default()),
         }
     }
@@ -1811,6 +1876,17 @@ impl WorkerRuntime {
 
     pub fn note_token_progress(&self) {
         let now = super::liveness::now_ms();
+        // The stamps are millisecond stamps and the wake keeps one permit, so
+        // a token within the millisecond of the previous one has nothing to
+        // record: it leaves with one plain load. Every stream of the worker
+        // reports here for every token, from whichever core runs it; the
+        // three stores and the notifier's compare-exchange would otherwise
+        // bounce the worker's cache lines between cores once per token.
+        if self.last_token_ms.load(Ordering::Relaxed) == now
+            && !self.transport_failed.load(Ordering::Relaxed)
+        {
+            return;
+        }
         self.last_token_ms.store(now, Ordering::Relaxed);
         self.last_contact_ms.store(now, Ordering::Relaxed);
         self.transport_failed.store(false, Ordering::Relaxed);
@@ -1889,7 +1965,20 @@ impl WorkerRuntime {
     }
 
     pub fn prefill_backlog(&self) -> Duration {
-        self.prefill.lock().backlog()
+        self.prefill.lock().eta(0)
+    }
+
+    pub fn prefill_eta(&self, tokens: u64) -> Duration {
+        self.prefill.lock().eta(tokens)
+    }
+
+    pub fn prefill_answered_ago(&self) -> Option<Duration> {
+        self.prefill_answered_ago_at(super::liveness::now_ms().max(1))
+    }
+
+    /// [`Self::prefill_answered_ago`] as of `now_ms` on the gateway clock.
+    pub fn prefill_answered_ago_at(&self, now_ms: u64) -> Option<Duration> {
+        self.prefill.lock().answered_ago(now_ms)
     }
 
     pub fn swap_waiting_reqs(&self, waiting: i64) -> i64 {
@@ -2000,6 +2089,24 @@ impl WorkerRuntime {
     }
     pub fn tracked_load(&self) -> usize {
         self.tracked_in_flight.load(Ordering::Relaxed)
+    }
+    /// A stream from this worker produced its first token or completion.
+    pub fn note_output_started(&self) {
+        self.producing_streams.fetch_add(1, Ordering::Relaxed);
+    }
+    /// A stream that had produced output ended.
+    pub fn note_output_ended(&self) {
+        let _ = self
+            .producing_streams
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                Some(n.saturating_sub(1))
+            });
+    }
+    /// See [`Worker::output_silence`]: the age of the last token or
+    /// completion while a stream that produced output is still open.
+    pub fn output_silence(&self) -> Option<Duration> {
+        (self.producing_streams.load(Ordering::Relaxed) > 0)
+            .then(|| Self::age_of(self.last_token_ms.load(Ordering::Relaxed)))
     }
     /// The load counter left zero: the wedged rule's clock starts now.
     fn note_busy_started(&self) {
@@ -2737,6 +2844,14 @@ impl Worker for BasicWorker {
         self.runtime.load().prefill_backlog()
     }
 
+    fn prefill_eta(&self, tokens: u64) -> Duration {
+        self.runtime.load().prefill_eta(tokens)
+    }
+
+    fn prefill_answered_ago(&self) -> Option<Duration> {
+        self.runtime.load().prefill_answered_ago()
+    }
+
     fn note_tracked_started(&self) {
         self.runtime.load().note_tracked_started();
     }
@@ -2747,6 +2862,18 @@ impl Worker for BasicWorker {
 
     fn tracked_load(&self) -> usize {
         self.runtime.load().tracked_load()
+    }
+
+    fn note_output_started(&self) {
+        self.runtime.load().note_output_started();
+    }
+
+    fn note_output_ended(&self) {
+        self.runtime.load().note_output_ended();
+    }
+
+    fn output_silence(&self) -> Option<Duration> {
+        self.runtime.load().output_silence()
     }
 
     fn is_available(&self) -> bool {
@@ -3212,6 +3339,7 @@ mod tests {
     use super::*;
     use crate::worker::{
         circuit_breaker::{CircuitBreakerConfig, CircuitState},
+        liveness::now_ms,
         BasicWorkerBuilder,
     };
 
@@ -3887,6 +4015,11 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// The load counter's increment, a million times: the count is exact,
+    /// and the rate is printed. The rate is machine-bound (a loaded or slow
+    /// machine reaches a fraction of a quiet one's), so the unit suite
+    /// asserts no absolute floor; `SMG_TEST_LOAD_COUNTER_FLOOR=<ops/s>` turns
+    /// the printed measurement into an assertion for a run on a known machine.
     #[test]
     #[expect(clippy::print_stderr)]
     fn test_load_counter_performance() {
@@ -3904,16 +4037,28 @@ mod tests {
             worker.increment_load();
         }
         let duration = start.elapsed();
+        assert_eq!(worker.load(), iterations);
 
         let ops_per_sec = iterations as f64 / duration.as_secs_f64();
         eprintln!("Load counter operations per second: {ops_per_sec:.0}");
 
-        // Lower bound is intentionally generous so this microbench does
-        // not flake on CI runners under contention. A relaxed Acquire/
-        // Release atomic increment should comfortably exceed this on any
-        // reasonable hardware — observed CI floor is around 1M ops/sec,
-        // so 500k gives a 2x safety margin.
-        assert!(ops_per_sec > 500_000.0);
+        // An asked-for floor is an assertion; an unreadable or malformed one
+        // is an error, not a silently skipped check: only an absent variable
+        // means no floor was asked for.
+        match std::env::var("SMG_TEST_LOAD_COUNTER_FLOOR") {
+            Err(std::env::VarError::NotPresent) => {}
+            Err(error) => panic!("SMG_TEST_LOAD_COUNTER_FLOOR is unreadable: {error}"),
+            Ok(floor) => {
+                let floor: f64 = match floor.parse::<f64>() {
+                    Ok(floor) if floor.is_finite() => floor,
+                    _ => panic!("SMG_TEST_LOAD_COUNTER_FLOOR {floor:?} is not a finite number"),
+                };
+                assert!(
+                    ops_per_sec > floor,
+                    "load counter: {ops_per_sec:.0} ops/s, under the asked-for floor of {floor:.0}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -4773,6 +4918,72 @@ mod tests {
     }
 
     #[test]
+    fn a_token_within_the_stamped_millisecond_records_nothing_new_and_keeps_the_semantics() {
+        let runtime = WorkerRuntime::new("http://w1:8000", WorkerStatus::Ready);
+        let wake = runtime.contact_wake();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        // Whether the notifier holds a permit: `notify_one` leaves one for a
+        // later waiter, so a waiter that returns within the bound found it.
+        let permit = |bound_ms: u64| {
+            rt.block_on(async {
+                time::timeout(Duration::from_millis(bound_ms), wake.notified())
+                    .await
+                    .is_ok()
+            })
+        };
+
+        // Two tokens inside one millisecond: the first stamps and leaves the
+        // permit, the second has nothing new to record and leaves none.
+        // Retried until both calls land in the same millisecond.
+        let mut aligned = false;
+        for _ in 0..1_000 {
+            // A fresh millisecond: the runtime's own construction stamp (or the
+            // previous attempt's) must not be the one the first token repeats.
+            thread::sleep(Duration::from_millis(2));
+            let ms = now_ms();
+            runtime.note_token_progress();
+            assert!(permit(50), "the first token leaves the notifier's permit");
+            runtime.note_token_progress();
+            if now_ms() == ms {
+                aligned = true;
+                break;
+            }
+            // The millisecond turned between the two: the second one stamped
+            // and left a permit; drain it and try again.
+            let _ = permit(50);
+        }
+        assert!(aligned, "two tokens never landed in one millisecond");
+        assert!(
+            !permit(10),
+            "a token within the stamped millisecond leaves no new permit"
+        );
+
+        // A transport failure flagged between two tokens of one millisecond is
+        // cleared by the next token all the same, and that token stamps.
+        runtime.note_transport_failure();
+        assert!(runtime.transport_failure_pending());
+        runtime.note_token_progress();
+        assert!(
+            !runtime.transport_failure_pending(),
+            "progress clears a transport failure, same millisecond or not"
+        );
+        assert!(permit(50), "the clearing token wakes the notifier");
+
+        // Once the millisecond turns, the next token stamps again.
+        let stamped = runtime.progress_reference_ms();
+        thread::sleep(Duration::from_millis(3));
+        runtime.note_token_progress();
+        assert!(runtime.progress_reference_ms() > stamped);
+        assert!(
+            permit(50),
+            "a token in a new millisecond wakes the notifier"
+        );
+    }
+
+    #[test]
     fn progress_is_counted_from_the_first_dispatch_not_registration() {
         let runtime = WorkerRuntime::new("http://w1:8000", WorkerStatus::Ready);
         let registered = runtime.progress_reference_ms();
@@ -4791,6 +5002,28 @@ mod tests {
         );
         assert!(runtime.try_increment_load(4));
         assert!(runtime.progress_reference_ms() > registered);
+    }
+
+    #[test]
+    fn output_silence_is_read_only_while_a_stream_that_produced_output_is_open() {
+        let worker: Arc<dyn Worker> =
+            Arc::new(BasicWorkerBuilder::new("grpc://decode:30000").build());
+        // Nothing in flight it has shown output on: nothing to judge.
+        assert!(worker.output_silence().is_none());
+        worker.note_output_started();
+        worker.note_token_progress();
+        thread::sleep(Duration::from_millis(20));
+        let silence = worker.output_silence().expect("a producing stream is open");
+        assert!(silence >= Duration::from_millis(20), "{silence:?}");
+        // A token: the silence restarts.
+        worker.note_token_progress();
+        assert!(worker.output_silence().expect("still open") < silence);
+        // The stream ended: nothing to judge again, however quiet the worker.
+        worker.note_output_ended();
+        assert!(worker.output_silence().is_none());
+        // The count never goes negative.
+        worker.note_output_ended();
+        assert!(worker.output_silence().is_none());
     }
 
     #[test]
@@ -4813,6 +5046,58 @@ mod tests {
         // A dropped stream releases its tokens without a rate sample.
         runtime.note_prefill_ended_at(2_000_000, true, None, 3_500);
         assert_eq!(runtime.prefill_backlog(), Duration::ZERO);
+    }
+
+    #[test]
+    fn prefill_eta_adds_a_prompt_about_to_be_dispatched_to_the_backlog() {
+        // The disaggregated prefill leg's bound is read before its prompt is
+        // booked: the ETA is the backlog plus that prompt, at the rate the
+        // worker has shown (the cold prior until it has).
+        let runtime = WorkerRuntime::new("http://w1:8000", WorkerStatus::Ready);
+        assert_eq!(runtime.prefill_eta(0), Duration::ZERO);
+        assert_eq!(runtime.prefill_eta(30_000), Duration::from_secs(3));
+        runtime.note_prefill_started_at(20_000, true, 1_000);
+        assert_eq!(runtime.prefill_eta(30_000), Duration::from_secs(5));
+        assert_eq!(runtime.prefill_eta(0), runtime.prefill_backlog());
+        // A measured rate (20k tokens over 1.5 s of busy time: 13,333
+        // tokens/s) replaces the prior.
+        runtime.note_prefill_ended_at(10_000, true, Some(0), 1_600);
+        runtime.note_prefill_ended_at(10_000, true, Some(0), 2_500);
+        assert_eq!(runtime.prefill_rate_tps(), 13_333);
+        assert_eq!(runtime.prefill_eta(40_000), Duration::from_millis(3_000));
+    }
+
+    #[test]
+    fn the_latest_first_response_is_stamped_on_the_worker() {
+        // A prefill leg past its own bound asks whether its worker answers
+        // anything at all: the stamp is the latest first response to any
+        // prompt dispatched there, never the drop of a stream that got none.
+        let runtime = WorkerRuntime::new("http://w1:8000", WorkerStatus::Ready);
+        assert_eq!(
+            runtime.prefill_answered_ago_at(5_000),
+            None,
+            "never answered"
+        );
+        runtime.note_prefill_started_at(256, true, 1_000);
+        runtime.note_prefill_started_at(256, true, 1_000);
+        runtime.note_prefill_ended_at(256, true, None, 1_500);
+        assert_eq!(
+            runtime.prefill_answered_ago_at(5_000),
+            None,
+            "a dropped stream is no answer"
+        );
+        runtime.note_prefill_ended_at(256, true, Some(0), 2_000);
+        assert_eq!(
+            runtime.prefill_answered_ago_at(5_000),
+            Some(Duration::from_secs(3))
+        );
+        runtime.note_prefill_started_at(64, false, 6_000);
+        runtime.note_prefill_ended_at(64, false, Some(0), 6_500);
+        assert_eq!(
+            runtime.prefill_answered_ago_at(7_000),
+            Some(Duration::from_millis(500)),
+            "a non-streaming generation's one answer counts too"
+        );
     }
 
     #[test]
@@ -5046,5 +5331,43 @@ mod tests {
         runtime.note_admitted();
         assert_eq!(runtime.warmup_growth(900), 0);
         assert_eq!(runtime.warmup_growth(1300), 400);
+    }
+}
+
+#[cfg(test)]
+mod running_window_label_tests {
+    use std::collections::HashMap;
+
+    use crate::worker::{BasicWorkerBuilder, Worker};
+
+    fn with_labels(pairs: &[(&str, &str)]) -> impl Worker {
+        BasicWorkerBuilder::new("http://w:1")
+            .labels(
+                pairs
+                    .iter()
+                    .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                    .collect::<HashMap<_, _>>(),
+            )
+            .build()
+    }
+
+    /// A window label wider than the count's type (an explicit flag above
+    /// 65535 on a large engine) saturates, as the widest window the gate and
+    /// the capacity sum can use, instead of reading as no window at all; a
+    /// zero or a word still reads as none, and `max_num_seqs` still wins.
+    #[test]
+    fn a_window_label_wider_than_the_count_saturates_instead_of_reading_as_none() {
+        for (value, expected) in [
+            ("8", Some(8)),
+            ("65535", Some(65535)),
+            ("70000", Some(65535)),
+            ("0", None),
+            ("none", None),
+        ] {
+            let worker = with_labels(&[("max_running_requests", value)]);
+            assert_eq!(worker.max_running_requests(), expected, "{value}");
+        }
+        let both = with_labels(&[("max_num_seqs", "16"), ("max_running_requests", "70000")]);
+        assert_eq!(both.max_running_requests(), Some(16));
     }
 }

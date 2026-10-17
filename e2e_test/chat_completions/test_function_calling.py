@@ -10,10 +10,13 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 
+import httpx
 import openai
 import pytest
 import smg_client
+from infra.constants import get_parser
 
 logger = logging.getLogger(__name__)
 
@@ -970,6 +973,55 @@ def get_travel_messages():
     ]
 
 
+# Two tools whose `$defs` give one name, DataType, two definitions. The pair is valid, since each
+# tool's parameters is its own schema document. The legacy path merges every tool into one schema
+# and refuses the pair with a 400; a structural-tag path serves it with each tool's own definition.
+CONFLICTING_DEFS_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "tool1",
+            "description": "Tool 1 with conflicting $defs",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "data": {"$ref": "#/$defs/DataType"},
+                },
+                "required": ["data"],
+                "$defs": {
+                    "DataType": {
+                        "type": "object",
+                        "properties": {"value": {"type": "string"}},
+                        "required": ["value"],
+                    },
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "tool2",
+            "description": "Tool 2 with conflicting $defs",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "data": {"$ref": "#/$defs/DataType"},
+                },
+                "required": ["data"],
+                "$defs": {
+                    "DataType": {  # Different definition for DataType
+                        "type": "object",
+                        "properties": {"value": {"type": "number"}},
+                        "required": ["value"],
+                    },
+                },
+            },
+        },
+    },
+]
+
+
 class _TestToolChoiceBase:
     """Base class for tool_choice tests. Not collected by pytest (underscore prefix)."""
 
@@ -1597,50 +1649,7 @@ class _TestToolChoiceBase:
     def test_conflicting_defs_required_tool_choice(self, model, api_client):
         """Test that conflicting $defs with required tool_choice returns 400 error."""
 
-        conflicting_tools = [
-            {
-                "type": "function",
-                "function": {
-                    "name": "tool1",
-                    "description": "Tool 1 with conflicting $defs",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "data": {"$ref": "#/$defs/DataType"},
-                        },
-                        "required": ["data"],
-                        "$defs": {
-                            "DataType": {
-                                "type": "object",
-                                "properties": {"value": {"type": "string"}},
-                                "required": ["value"],
-                            },
-                        },
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "tool2",
-                    "description": "Tool 2 with conflicting $defs",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "data": {"$ref": "#/$defs/DataType"},
-                        },
-                        "required": ["data"],
-                        "$defs": {
-                            "DataType": {  # Different definition for DataType
-                                "type": "object",
-                                "properties": {"value": {"type": "number"}},
-                                "required": ["value"],
-                            },
-                        },
-                    },
-                },
-            },
-        ]
+        conflicting_tools = CONFLICTING_DEFS_TOOLS
 
         messages = [
             {
@@ -1711,6 +1720,32 @@ class TestToolChoiceQwen(_TestToolChoiceBase):
 
     # No flaky tests for Qwen
     FLAKY_TESTS: set[str] = set()
+
+    def test_conflicting_defs_required_tool_choice(self, model, api_client):
+        """Under --parser symphony the pair is served: the Qwen3 table gives the forced call a
+        structural tag that carries each tool's own `$defs`, so the call's arguments follow the
+        called tool's definition (a string for tool1, a number for tool2). On the legacy path the
+        merged schema refuses the pair, as the base test expects."""
+        if get_parser() != "symphony":
+            super().test_conflicting_defs_required_tool_choice(model, api_client)
+            return
+        response = api_client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": "Test the conflicting tools"}],
+            max_tokens=100,
+            temperature=0.1,
+            tools=CONFLICTING_DEFS_TOOLS,
+            tool_choice="required",
+            stream=False,
+        )
+        calls = response.choices[0].message.tool_calls
+        assert calls, "tool_choice=required forces a call"
+        call = calls[0]
+        value = json.loads(call.function.arguments)["data"]["value"]
+        expected = {"tool1": str, "tool2": (int, float)}[call.function.name]
+        assert isinstance(value, expected), (
+            f"{call.function.name} got value {value!r}: not its own DataType definition"
+        )
 
 
 # =============================================================================
@@ -1891,3 +1926,86 @@ class TestMultiTurnToolCall:
                 content_parts.append(delta.content)
 
         assert "".join(content_parts), "Streaming follow-up should produce text content"
+
+
+@pytest.mark.engine("tokenspeed")
+@pytest.mark.gpu(1)
+@pytest.mark.model("Qwen/Qwen3-4B-Instruct-2507")
+@pytest.mark.gateway(
+    extra_args=["--parser", "symphony", "--tool-call-parser", "qwen", "--history-backend", "memory"]
+)
+@pytest.mark.parametrize("setup_backend", ["grpc"], indirect=True)
+@pytest.mark.parametrize("api_client", ["openai"], indirect=True)
+class TestConstrainedDecodingAlways:
+    """A worker on ``constrained_decoding: always`` takes the table's grammar for
+    the calls a request allows under ``tool_choice: auto``, from the first token
+    (smg#3504, smg#3505). The TokenSpeed e2e workers run xgrammar and start
+    every grammar at the first token, so this proves the engine accepts the
+    triggered-tags grammar with no call required: the request succeeds, every
+    call it does make names a declared tool with JSON arguments, and a request
+    without tools, which the policy leaves free, succeeds as before.
+
+    Not a ``_TestToolChoiceBase`` subclass: pytest would collect that class's
+    tests under this gateway too. Its helpers are used directly.
+    """
+
+    def test_an_always_worker_is_constrained_under_auto(self, model, api_client, setup_backend):
+        gateway = setup_backend[3]
+        worker = gateway.list_workers(strict=True)[0]
+        # The policy arrives as a worker label through the update route, the way
+        # an operator sets it before the engine declares it itself; the update
+        # is applied asynchronously, so wait until the worker carries it.
+        resp = httpx.patch(
+            f"{gateway.base_url}/workers/{worker.id}",
+            json={"labels": {"constrained_decoding": "always"}},
+            timeout=10.0,
+        )
+        assert resp.status_code in (200, 202), f"PATCH /workers: {resp.status_code} {resp.text}"
+        deadline = time.perf_counter() + 30.0
+        labelled = None
+        while time.perf_counter() < deadline:
+            shown = httpx.get(f"{gateway.base_url}/workers/{worker.id}", timeout=10.0)
+            if (
+                shown.status_code == 200
+                and shown.json().get("labels", {}).get("constrained_decoding") == "always"
+            ):
+                labelled = shown.json()
+                break
+            time.sleep(1.0)
+        assert labelled is not None, "the constrained_decoding label never reached the worker"
+
+        helpers = _TestToolChoiceBase()
+        tools = helpers._auto_decision_tools()
+        response = api_client.chat.completions.create(
+            model=model,
+            messages=helpers.AUTO_TOOL_NEEDED_MESSAGES,
+            max_tokens=512,
+            temperature=0.0,
+            tools=tools,
+            tool_choice="auto",
+            stream=False,
+        )
+        choice = response.choices[0]
+        if choice.message.tool_calls:
+            # The grammar is what keeps every call to a declared tool with
+            # JSON-object arguments, so the name check is the property that
+            # shows it took effect (the unconstrained helper skips names).
+            declared = {tool["function"]["name"] for tool in tools}
+            for call in choice.message.tool_calls:
+                assert call.function.name in declared, call.function.name
+                arguments = json.loads(call.function.arguments)
+                assert isinstance(arguments, dict), call.function.arguments
+            assert choice.finish_reason == "tool_calls"
+        else:
+            # The grammar lets free text through; the model may answer instead.
+            assert (choice.message.content or "").strip()
+            assert choice.finish_reason == "stop"
+
+        plain = api_client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": "Reply with the single word hello."}],
+            max_tokens=16,
+            temperature=0.0,
+            stream=False,
+        )
+        assert (plain.choices[0].message.content or "").strip()

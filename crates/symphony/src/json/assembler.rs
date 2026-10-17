@@ -5,41 +5,13 @@
 //! arguments value has begun (or the object has closed without one), `ToolCallArguments` for every
 //! run of new argument bytes, `ToolCallEnd` when the object closes. The fragments are the model's
 //! own bytes: what a client receives, concatenated, is exactly what the model wrote as the
-//! arguments value, spacing included, and no fragment ever has to be revised. The old crate had no
+//! arguments value, spacing included, and no fragment ever has to be revised; an object that ends
+//! without an arguments member is a call with none, `{}`, one fragment of no bytes, as every
+//! other syntax writes a call with nothing in it. The old crate had no
 //! equivalent; it parsed the partial object on every chunk, re-serialized the arguments and emitted
 //! the difference, which is how `{"city": "Paris"}` reached clients as `{"city":"Paris"}`.
 //!
-//! Every byte of the object lands in exactly one event: the head up to the arguments value is the
-//! `source` of `ToolCallStart`, the argument bytes are the `source` of their fragments, the tail
-//! after the value is the `source` of `ToolCallEnd`. When the arguments come before the name they
-//! are held until the name is whole, since a call starts before its arguments.
-//!
-//! The assembler keeps the promise `ToolCallArguments` makes, that the fragments so far always form
-//! a valid JSON prefix, as far as the prefix parser can tell: each new run of argument bytes is
-//! judged by [`Prefix`], which accepts what [`PartialJson`](super::PartialJson) accepts in prefix
-//! mode, before it is emitted, and from the first byte it cannot take, the argument bytes come
-//! back as `Malformed` with `InvalidArguments` instead, nothing already emitted being revised. The
-//! prefix parser tolerates what the old crate tolerated (a literal's prefix, a bracket closed by
-//! the wrong kind where the parent can take it), so the promise is exactly as strong as that
-//! parser.
-//!
-//! Every byte is read once. The outline is taken by a [`Scanner`] that keeps its place between
-//! pieces, and the prefix is judged on the bytes that arrived, so a call's cost is linear in its
-//! length however the text is cut: the first version read the whole text again on every piece,
-//! and a 259 KB argument string fed by the character took 800 s against 0.03 s whole.
-//!
-//! A started call whose object never closes is closed at `finish` with what arrived, and the bytes
-//! after its arguments value (a comma cut short, a complete member, or bytes that are no member)
-//! come back as `Malformed` with `UnterminatedRegion`.
-//!
-//! `feed` takes one piece and returns how many of its bytes the object took: all of them before the
-//! close, and up to the closing brace in the piece that carries it, so the format routes whatever
-//! follows the object (a closing marker, more text) itself. Bytes fed after the close are not
-//! taken.
-//!
-//! What the assembler does not decide: the call's index and id (the format mints them and passes
-//! them to [`Assembler::new`]), whether the name is a declared tool, and whether a string-valued
-//! arguments member should be decoded. The format decides those with the events in hand.
+//! Notes on what this module decides, and on what it leaves open: `docs/assemblers.md`.
 
 use crate::{
     event::{Event, Events, MalformedReason, Text},
@@ -67,6 +39,14 @@ pub struct Assembler {
     /// The argument byte from which the arguments stopped being a valid JSON prefix, if they did.
     invalid_from: Option<usize>,
     done: bool,
+    /// Whether the object ends where its bytes stop being a call's object: where its arguments
+    /// stop being a JSON prefix, or where its outline stops short of the closing brace (the brace
+    /// left off, text where a member should be, another member's value that stops being JSON).
+    /// The bytes from there on are then the caller's
+    /// ([`Self::refused_tail`]), for a shaped call's trailer to read, rather than the object's.
+    ends_where_refused: bool,
+    /// Where in `text` the object ended so, until the bytes from there were handed back.
+    ended_at: Option<usize>,
 }
 
 impl Assembler {
@@ -83,7 +63,47 @@ impl Assembler {
             prefix: Prefix::default(),
             invalid_from: None,
             done: false,
+            ends_where_refused: false,
+            ended_at: None,
         }
+    }
+
+    /// Whether the arguments stopped being a JSON prefix.
+    pub fn refused(&self) -> bool {
+        self.invalid_from.is_some()
+    }
+
+    /// The object ends where its bytes stop being a call's object: where its arguments stop being
+    /// a JSON prefix, or where its outline stops short of the closing brace, the other members'
+    /// values judged as JSON too (see [`Self::refused_tail`]).
+    pub fn ending_where_refused(mut self) -> Self {
+        self.ends_where_refused = true;
+        self.scanner = std::mem::take(&mut self.scanner).judging_values();
+        self
+    }
+
+    /// Whether the object ended where its arguments stopped being a JSON prefix: it ends there
+    /// ([`Self::ending_where_refused`]), and they did. An object that ended where its outline
+    /// stopped, or one that closed after its arguments broke, did not.
+    pub fn ended_where_refused(&self) -> bool {
+        self.ends_where_refused && self.invalid_from.is_some()
+    }
+
+    /// Where the outline stopped short of the object's close, for an object that ends there.
+    fn stopped_at(&self) -> Option<usize> {
+        self.scanner
+            .stopped_at()
+            .filter(|_| self.ends_where_refused)
+    }
+
+    /// For an object that ends where refused: the bytes from where it ended on, which the object
+    /// took before that was known, handed back once with the character before them, for the
+    /// caller to read as what follows the arguments. `None` otherwise.
+    pub fn refused_tail(&mut self) -> Option<(String, Option<char>)> {
+        let at = self.ended_at.take()?;
+        let tail = self.text.split_off(at);
+        let before = self.text.chars().next_back();
+        Some((tail, before))
     }
 
     /// Whether the object has closed, as a call or as an object that named none; `feed` takes
@@ -122,12 +142,19 @@ impl Assembler {
         let arguments = self.scanner.found().arguments.clone();
         if !self.started {
             let Some(name) = self.scanner.found().name.clone() else {
-                if let Some(close) = close {
-                    // Closed without a name: not a call. Said now, so `done` is true at the close.
-                    out.push(Event::Malformed {
-                        text: Text::uncounted(&self.text[..close]),
-                        why: MalformedReason::Other("a tool call without a name".to_string()),
-                    });
+                // Closed, or stopped short of its close, without a name: not a call. Said now, so
+                // `done` is true at the close or the stop.
+                if let Some(end) = close.or_else(|| self.stopped_at()) {
+                    if end > 0 {
+                        out.push(Event::Malformed {
+                            text: Text::uncounted(&self.text[..end]),
+                            why: MalformedReason::Other("a tool call without a name".to_string()),
+                        });
+                    }
+                    if close.is_none() {
+                        // The bytes from the stop on are the caller's (`refused_tail`).
+                        self.ended_at = Some(end);
+                    }
                     self.done = true;
                 }
                 return taken;
@@ -135,7 +162,11 @@ impl Assembler {
             let head_end = match (&arguments, close) {
                 (Some(span), _) => span.start,
                 (None, Some(close)) => close,
-                (None, None) => return taken,
+                // Stopped short of its close before any arguments: a call without them.
+                (None, None) => match self.stopped_at() {
+                    Some(at) => at,
+                    None => return taken,
+                },
             };
             out.push(Event::ToolCallStart {
                 index: self.index,
@@ -146,7 +177,30 @@ impl Assembler {
             self.started = true;
         }
         self.emit_new_argument_bytes(arguments.as_ref(), out);
+        if self.ended_at.is_none() {
+            self.ended_at = self.stopped_at();
+        }
+        if let Some(at) = self.ended_at {
+            // The object ends short of its close, unterminated: at the arguments' break, with
+            // nothing after them, or where its outline stopped, with what the outline read after
+            // them. The call ends with what arrived, and the bytes from there on are the caller's
+            // (`refused_tail`).
+            self.send_held(arguments.as_ref(), out);
+            self.no_arguments(arguments.as_ref(), out);
+            let tail_start = arguments
+                .as_ref()
+                .and_then(|span| span.end)
+                .map_or(at, |end| end.min(at));
+            out.push(Event::ToolCallEnd {
+                index: self.index,
+                source: Text::uncounted(&self.text[tail_start..at]),
+            });
+            self.done = true;
+            return taken;
+        }
         if let Some(close) = close {
+            self.send_held(arguments.as_ref(), out);
+            self.no_arguments(arguments.as_ref(), out);
             let tail_start = arguments
                 .as_ref()
                 .and_then(|span| span.end)
@@ -160,19 +214,37 @@ impl Assembler {
         taken
     }
 
+    /// The call ends without an arguments member, its key never having come: it is a call with
+    /// none, `{}`, one fragment that accounts for no bytes, so that a client reads the same
+    /// arguments for it as for one written `"arguments": {}`, and the other syntaxes' call with
+    /// nothing in it. Pushed before the end, where the object closed or ended short of its close.
+    /// A member whose key came and whose value never began is not one: the call ends with what
+    /// arrived, as before, and nothing is made up for a value the model botched.
+    fn no_arguments(&self, arguments: Option<&Span>, out: &mut Events) {
+        if arguments.is_none() && !self.scanner.found().arguments_named {
+            out.push(Event::ToolCallArguments {
+                index: self.index,
+                json: "{}".to_string(),
+                source: Text::default(),
+            });
+        }
+    }
+
     /// No more bytes will come, and the object never closed. A call that started is closed with
     /// what arrived, the bytes after its arguments value returned as `Malformed`; an object that
     /// never named its call comes back as `Malformed` whole. Either way no byte is lost.
-    pub fn finish(self, out: &mut Events) {
+    pub fn finish(mut self, out: &mut Events) {
         if self.done {
             return;
         }
         let found = self.scanner.found().clone();
         if self.started {
             // `feed` has emitted every argument byte that arrived, as fragments or as malformed
-            // text. The object never closed, so what follows the arguments value is the tail of an
-            // unterminated region: a comma cut short, a complete member, or bytes that are no
-            // member at all. A closed object's tail is the source of its `ToolCallEnd` instead.
+            // text, but for a word it still held; that goes first, as the prefix it is. The object
+            // never closed, so what follows the arguments value is the tail of an unterminated
+            // region: a comma cut short, a complete member, or bytes that are no member at all. A
+            // closed object's tail is the source of its `ToolCallEnd` instead.
+            self.send_held(found.arguments.as_ref(), out);
             let tail_start = found
                 .arguments
                 .as_ref()
@@ -200,6 +272,24 @@ impl Assembler {
         }
     }
 
+    /// The argument bytes held back ([`Self::emit_new_argument_bytes`]), sent as the prefix they
+    /// are when the value can take no more bytes: at its end, or the stream's.
+    fn send_held(&mut self, arguments: Option<&Span>, out: &mut Events) {
+        let Some(span) = arguments else {
+            return;
+        };
+        let bytes = span.text(&self.text);
+        if self.invalid_from.is_none() && self.emitted < bytes.len() {
+            let held = &bytes[self.emitted..];
+            out.push(Event::ToolCallArguments {
+                index: self.index,
+                json: held.to_string(),
+                source: Text::uncounted(held),
+            });
+            self.emitted = bytes.len();
+        }
+    }
+
     /// The argument bytes that arrived since the last call: a fragment for the part that keeps the
     /// arguments a valid JSON prefix, malformed text for the rest, once the prefix has broken.
     fn emit_new_argument_bytes(&mut self, arguments: Option<&Span>, out: &mut Events) {
@@ -220,6 +310,19 @@ impl Assembler {
                 Some(from) => *self.invalid_from.insert(from.max(self.emitted)),
             },
         };
+        // Bytes the judge may still go back to (a word being spelled, `nu`; a surrogate escape
+        // awaiting its low half; the whitespace before a value at the top) are held while the
+        // value is still open: a fragment passed on cannot be taken back, so the pieces would say
+        // `n` where the whole says nothing. They are sent once the next bytes settle them, with
+        // the value's end, or when no more bytes can come ([`Self::send_held`]), as the prefix
+        // they are then. A string-valued arguments streams as written, the one shape where the
+        // pieces may say more than the whole (`Prefix::held_from`).
+        let valid_end = match self.prefix.held_from() {
+            Some(start) if span.end.is_none() && self.invalid_from.is_none() => {
+                valid_end.min(start).max(self.emitted)
+            }
+            _ => valid_end,
+        };
         if self.emitted < valid_end {
             let fresh = &bytes[self.emitted..valid_end];
             out.push(Event::ToolCallArguments {
@@ -229,13 +332,36 @@ impl Assembler {
             });
             self.emitted = valid_end;
         }
-        if self.emitted < bytes.len() {
+        if self.ends_where_refused && self.invalid_from.is_some() {
+            // The object ends at the break; what follows is handed back, not reported as its
+            // malformed rest.
+            self.ended_at = Some(span.start + valid_end);
+            return;
+        }
+        // Past the break the rest is malformed; before any break what is not sent is held.
+        if self.invalid_from.is_some() && self.emitted < bytes.len() {
             out.push(Event::Malformed {
                 text: Text::uncounted(&bytes[self.emitted..]),
                 why: MalformedReason::InvalidArguments,
             });
             self.emitted = bytes.len();
         }
+    }
+}
+
+impl crate::engine::CallAssembler for Assembler {
+    fn feed(&mut self, text: &str, _declared: &crate::tagged::Declared, out: &mut Events) -> usize {
+        self.feed(text, out)
+    }
+
+    /// The object closed the call at its brace; the region's closing marker is the region's.
+    fn close(self: Box<Self>, _terminal: &str, out: &mut Events) -> bool {
+        (*self).finish(out);
+        false
+    }
+
+    fn finish(self: Box<Self>, out: &mut Events) {
+        (*self).finish(out);
     }
 }
 
@@ -289,6 +415,90 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// The malformed text of the events, joined.
+    fn malformed(events: &[Event]) -> String {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Malformed { text, .. } => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_top_level_string_a_surrogate_breaks_is_the_one_shape_the_pieces_say_more_of() {
+        // A string-valued arguments streams as written (a stringified call object is one), and
+        // the parser refuses the whole value when a surrogate escape breaks inside it: the pieces
+        // have said the string's bytes before the break where the whole says nothing. Every
+        // byte is accounted for either way, and nothing a piece said is taken back.
+        let object = r#"{"name": "f", "arguments": "ab\udc00"}"#;
+        let whole = run(&[object]);
+        assert_eq!(arguments(&whole), "");
+        assert_eq!(malformed(&whole), r#""ab\udc00""#);
+        let per_char: Vec<&str> = object
+            .char_indices()
+            .map(|(i, c)| &object[i..i + c.len_utf8()])
+            .collect();
+        let streamed = run(&per_char);
+        assert_eq!(arguments(&streamed), r#""ab\udc0"#);
+        assert_eq!(malformed(&streamed), r#"0""#);
+        for events in [&whole, &streamed] {
+            assert_eq!(sources(events), object);
+        }
+    }
+
+    #[test]
+    fn a_word_under_way_is_held_so_the_pieces_say_of_it_what_the_whole_says() {
+        // A word that is no literal is refused from its first letter, and nothing of it is
+        // passed on as arguments however the bytes were cut; a literal, whole or cut short at
+        // the end, is sent once it is spelled or once nothing more can come; a number is sent as
+        // far as it is one. A surrogate escape that breaks behind its backslash takes the
+        // backslash with it. Open values end with the stream, closed ones at their object's brace.
+        let cases = [
+            ("nosuch", "", "nosuch"),
+            ("trash", "", "trash"),
+            ("nul", "nul", ""),
+            ("null", "null", ""),
+            ("true", "true", ""),
+            ("1x", "1", "x"),
+            (r#"{"a": nosuch}"#, r#"{"a": "#, "nosuch}"),
+            (r#"{"a": null}"#, r#"{"a": null}"#, ""),
+            ("[true, trash]", "[true, ", "trash]"),
+            (r#"{"e": "\ud83c\x"}"#, r#"{"e": "\ud83c"#, r#"\x"}"#),
+            (r#"{"e": "\ud83c\ude00"}"#, r#"{"e": "\ud83c\ude00"}"#, ""),
+            (r#""ab\ud83c\ude00 c""#, r#""ab\ud83c\ude00 c""#, ""),
+            // The outline keeps the whitespace before the value out of the arguments' span.
+            ("\tnosuch", "", "nosuch"),
+            (" null", "null", ""),
+        ];
+        for (value, expected_arguments, expected_malformed) in cases {
+            for closed in [false, true] {
+                let brace = if closed { "}" } else { "" };
+                let object = format!(r#"{{"name": "f", "arguments": {value}{brace}"#);
+                let whole = run(&[&object]);
+                let per_char: Vec<&str> = object
+                    .char_indices()
+                    .map(|(i, c)| &object[i..i + c.len_utf8()])
+                    .collect();
+                let streamed = run(&per_char);
+                for (how, events) in [("whole", &whole), ("per character", &streamed)] {
+                    assert_eq!(
+                        arguments(events),
+                        expected_arguments,
+                        "{object:?} {how}: arguments"
+                    );
+                    assert_eq!(
+                        malformed(events),
+                        expected_malformed,
+                        "{object:?} {how}: malformed"
+                    );
+                    assert_eq!(sources(events), object, "{object:?} {how}: every byte");
+                }
+            }
+        }
     }
 
     #[test]
@@ -376,23 +586,55 @@ mod tests {
     }
 
     #[test]
-    fn an_object_without_arguments_starts_and_ends_at_its_close() {
-        let events = run(&[r#"{"name": "f"}"#]);
-        assert_eq!(
-            events,
-            vec![
-                Event::ToolCallStart {
+    fn an_object_without_arguments_is_a_call_with_an_empty_object_that_starts_and_ends_at_its_close(
+    ) {
+        // The call starts at the close, since nothing before it says the object has no arguments
+        // member; its arguments are `{}`, one fragment of no bytes, as a call written
+        // `"arguments": {}` reads, and as every other syntax reads a call with nothing in it.
+        let expected = vec![
+            Event::ToolCallStart {
+                index: 0,
+                id: "call_0".into(),
+                name: "f".into(),
+                source: Text::uncounted(r#"{"name": "f"}"#),
+            },
+            Event::ToolCallArguments {
+                index: 0,
+                json: "{}".into(),
+                source: Text::default(),
+            },
+            Event::ToolCallEnd {
+                index: 0,
+                source: Text::default(),
+            },
+        ];
+        let text = r#"{"name": "f"}"#;
+        assert_eq!(run(&[text]), expected);
+        let per_char: Vec<&str> = text
+            .char_indices()
+            .map(|(i, c)| &text[i..i + c.len_utf8()])
+            .collect();
+        assert_eq!(run(&per_char), expected, "byte by byte");
+        // Other members do not make arguments: the call still has `{}`; without an arguments
+        // value the start's source is the whole object and the end's is empty, and the
+        // arguments written `{}` read the same.
+        for (text, expected, end) in [
+            (r#"{"name": "f", "id": 7}"#, "{}", ""),
+            (r#"{"id": 7, "name": "f"}"#, "{}", ""),
+            (r#"{"name": "f", "arguments": {}}"#, "{}", "}"),
+        ] {
+            let events = run(&[text]);
+            assert_eq!(arguments(&events), expected, "{text}");
+            assert_eq!(
+                events.last(),
+                Some(&Event::ToolCallEnd {
                     index: 0,
-                    id: "call_0".into(),
-                    name: "f".into(),
-                    source: Text::uncounted(r#"{"name": "f"}"#),
-                },
-                Event::ToolCallEnd {
-                    index: 0,
-                    source: Text::default(),
-                },
-            ]
-        );
+                    source: Text::uncounted(end),
+                }),
+                "{text}"
+            );
+            assert_eq!(sources(&events), text, "{text}");
+        }
     }
 
     #[test]
@@ -568,6 +810,178 @@ mod tests {
             .collect();
         assert_eq!(malformed, " junk}");
         assert_eq!(sources(&events), text);
+    }
+
+    #[test]
+    fn a_word_refused_hands_the_same_tail_back_whole_and_in_pieces() {
+        // The shaped calls' assembler ends where its arguments stop being a value and hands the
+        // bytes from there on back for the trailer to read. A word under way is held, so the
+        // bytes handed back start at the word's first letter whole and in pieces alike, and so
+        // do the arguments sent before them.
+        let feed = |text: &str, by_char: bool| {
+            let mut assembler = Assembler::new(0, "call_0").ending_where_refused();
+            let mut out = Events::new();
+            let mut back = String::new();
+            let pieces: Vec<&str> = if by_char {
+                text.char_indices()
+                    .map(|(i, c)| &text[i..i + c.len_utf8()])
+                    .collect()
+            } else {
+                vec![text]
+            };
+            for piece in pieces {
+                let taken = assembler.feed(piece, &mut out);
+                if let Some((tail, _)) = assembler.refused_tail() {
+                    back.push_str(&tail);
+                }
+                back.push_str(&piece[taken..]);
+            }
+            assembler.finish(&mut out);
+            let events = out.drain();
+            (arguments(&events), malformed(&events), back)
+        };
+        for (text, expected_arguments, expected_back) in [
+            (r#"{"name": "f", "arguments": nosuch</f>"#, "", "nosuch</f>"),
+            (r#"{"name": "f", "arguments": nul</f>"#, "nul", "</f>"),
+            (r#"{"name": "f", "arguments": null</f>"#, "null", "</f>"),
+            (
+                r#"{"name": "f", "arguments": {"a": nosuch}</f>"#,
+                r#"{"a": "#,
+                "nosuch}</f>",
+            ),
+        ] {
+            let whole = feed(text, false);
+            let in_pieces = feed(text, true);
+            assert_eq!(whole, in_pieces, "{text:?}: whole and in pieces");
+            assert_eq!(whole.0, expected_arguments, "{text:?}: arguments");
+            assert_eq!(whole.2, expected_back, "{text:?}: handed back");
+        }
+    }
+
+    /// With `ending_where_refused`, an object whose outline stops short of its closing brace (the
+    /// brace left off, text where a member should be) ends there, as one whose arguments break
+    /// does: the call ends with what the outline read after the arguments, and the bytes from the
+    /// stop on are handed back. Stopped before its name, the object named no call, and its bytes
+    /// come back malformed.
+    #[test]
+    fn an_object_ending_where_refused_ends_where_its_outline_stops() {
+        let feed = |text: &str, by_char: bool| {
+            let mut assembler = Assembler::new(0, "call_0").ending_where_refused();
+            let mut out = Events::new();
+            if by_char {
+                for (i, c) in text.char_indices() {
+                    assembler.feed(&text[i..i + c.len_utf8()], &mut out);
+                }
+            } else {
+                assert_eq!(assembler.feed(text, &mut out), text.len(), "{text:?}");
+            }
+            let tail = assembler.refused_tail();
+            assert!(
+                assembler.done() && !assembler.refused() && !assembler.ended_where_refused(),
+                "{text:?}"
+            );
+            assert_eq!(assembler.feed("more", &mut out), 0, "{text:?}");
+            assembler.finish(&mut out);
+            (out.drain(), tail)
+        };
+        let start = |source: &str| Event::ToolCallStart {
+            index: 0,
+            id: "call_0".into(),
+            name: "f".into(),
+            source: Text::uncounted(source),
+        };
+        let end = |source: &str| Event::ToolCallEnd {
+            index: 0,
+            source: Text::uncounted(source),
+        };
+        let head = r#"{"name": "f", "arguments": "#;
+        let value = Event::ToolCallArguments {
+            index: 0,
+            json: r#"{"a": 1}"#.into(),
+            source: Text::uncounted(r#"{"a": 1}"#),
+        };
+
+        let text = r#"{"name": "f", "arguments": {"a": 1}</f>"#;
+        let (events, tail) = feed(text, false);
+        assert_eq!(
+            events,
+            vec![start(head), value.clone(), end("")],
+            "a brace left off"
+        );
+        assert_eq!(tail, Some(("</f>".to_string(), Some('}'))));
+        let (events, tail) = feed(text, true);
+        assert_eq!(events.first(), Some(&start(head)), "byte by byte");
+        assert_eq!(arguments(&events), r#"{"a": 1}"#, "byte by byte");
+        assert_eq!(events.last(), Some(&end("")), "byte by byte");
+        assert_eq!(
+            tail,
+            Some(("<".to_string(), Some('}'))),
+            "the tail is what came in the piece the stop came in"
+        );
+
+        let (events, tail) = feed(
+            r#"{"name": "f", "arguments": {"a": 1}, "strict": true</f>"#,
+            false,
+        );
+        assert_eq!(
+            events,
+            vec![start(head), value.clone(), end(r#", "strict": true"#)],
+            "a literal in another member runs into the trailer"
+        );
+        assert_eq!(tail, Some(("</f>".to_string(), Some('e'))));
+
+        let (events, tail) = feed(r#"{"name": "f", "arguments": {"a": 1}, junk</f>"#, false);
+        assert_eq!(
+            events,
+            vec![start(head), value, end(", ")],
+            "what the outline read after the arguments is the end's"
+        );
+        assert_eq!(tail, Some(("junk</f>".to_string(), Some(' '))));
+
+        let (events, tail) = feed(r#"{"name": "f"</f>"#, false);
+        assert_eq!(
+            events,
+            vec![
+                start(r#"{"name": "f""#),
+                Event::ToolCallArguments {
+                    index: 0,
+                    json: "{}".into(),
+                    source: Text::default(),
+                },
+                end("")
+            ],
+            "a call without arguments has `{{}}`"
+        );
+        assert_eq!(tail, Some(("</f>".to_string(), Some('"'))));
+
+        // An arguments member whose value never began is not a call with none: its key came, so
+        // no `{}` is made up for it; the call ends with what arrived and the bytes from the stop
+        // on are the caller's, as before.
+        let (events, tail) = feed(r#"{"name": "f", "arguments": }</f>"#, false);
+        assert_eq!(
+            events,
+            vec![start(r#"{"name": "f", "arguments": "#), end("")],
+            "an arguments member without a value is not a call with `{{}}`"
+        );
+        assert_eq!(tail, Some(("}</f>".to_string(), Some(' '))));
+
+        let (events, tail) = feed(r#"{"arguments": {"a": 1}, x</f>"#, false);
+        assert_eq!(
+            events,
+            vec![Event::Malformed {
+                text: Text::uncounted(r#"{"arguments": {"a": 1}, "#),
+                why: MalformedReason::Other("a tool call without a name".into()),
+            }],
+            "stopped before its name: no call"
+        );
+        assert_eq!(tail, Some(("x</f>".to_string(), Some(' '))));
+
+        // A plain object keeps every byte, as before: its region's close ends it.
+        let mut assembler = Assembler::new(0, "call_0");
+        let mut out = Events::new();
+        assert_eq!(assembler.feed(text, &mut out), text.len());
+        assert!(!assembler.done());
+        assert_eq!(assembler.refused_tail(), None);
     }
 
     #[test]
