@@ -48,7 +48,7 @@ mod tests {
     use super::*;
     use crate::{
         engine::Engine,
-        event::{DropReason, Event, Events, Text},
+        event::{DropReason, Event, Events, MalformedReason, Text},
         input::{EngineFinish, Input},
         parser::Parser,
         tagged::Declared,
@@ -427,6 +427,27 @@ mod tests {
         assert_eq!(bytes(&events), output);
         assert_eq!(fragments_of(&events, 0), [r#"{"name": ""#, "Par"]);
         assert_eq!(ends(&events), 1);
+        // The arguments are no whole value and nothing is made up: one `Malformed` event of no
+        // bytes says so, right before the call's end.
+        let ended = events
+            .iter()
+            .position(|event| matches!(event, Event::ToolCallEnd { .. }))
+            .expect("the call ends");
+        assert!(
+            matches!(
+                &events[ended - 1],
+                Event::Malformed { text, why: MalformedReason::UnterminatedRegion }
+                    if text.text.is_empty()
+            ),
+            "{events:#?}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, Event::Malformed { .. }))
+                .count(),
+            1
+        );
         assert!(events.iter().any(|event| matches!(
             event,
             Event::ToolCallEnd { source, .. } if source.text.is_empty()
@@ -530,19 +551,48 @@ mod tests {
         ));
     }
 
+    /// The invoke's close inside a streamed string, by its own closing tag, the block's close or
+    /// the next invoke: nothing is closed for a value the model never closed; the fragments
+    /// stand, and the one `Malformed` event before the end carries the start of a tag held there
+    /// or no bytes and says that the arguments are no whole value, under the engine's name for a
+    /// region a marker closed.
     #[test]
-    fn a_tag_the_invokes_close_cut_short_inside_a_string_is_reported() {
-        let output = concat!(
-            "</mm:think><tool_call>\n<invoke name=\"alert\"><name>Par</na</invoke>\n",
-            "</tool_call>"
-        );
-        let events = run_with(tools(), "", &[output]);
-        assert_eq!(bytes(&events), output);
-        assert_eq!(arguments_of(&events, 0), r#"{"name": "Par"}"#);
-        assert!(events.iter().any(|event| matches!(
-            event,
-            Event::Malformed { text, .. } if text.text == "</na"
-        )));
+    fn the_invokes_close_inside_a_string_leaves_it_open_and_reports_what_was_held() {
+        for (output, held) in [
+            (
+                "</mm:think><tool_call>\n<invoke name=\"alert\"><name>Par</na</invoke>\n</tool_call>",
+                "</na",
+            ),
+            ("</mm:think><tool_call>\n<invoke name=\"alert\"><name>Par</tool_call>", ""),
+            (
+                "</mm:think><tool_call>\n<invoke name=\"alert\"><name>Par<invoke name=\"g\">\
+                 </invoke>\n</tool_call>",
+                "",
+            ),
+        ] {
+            let events = run_with(tools(), "", &[output]);
+            assert_eq!(bytes(&events), output, "{output:?}");
+            assert_eq!(arguments_of(&events, 0), r#"{"name": "Par"#, "{output:?}");
+            let ended = events
+                .iter()
+                .position(|event| matches!(event, Event::ToolCallEnd { index: 0, .. }))
+                .expect("the call ends");
+            assert!(
+                matches!(
+                    &events[ended - 1],
+                    Event::Malformed { text, why: MalformedReason::BlockWithoutACompleteCall } if text.text == held
+                ),
+                "{output:?}: {events:#?}"
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, Event::Malformed { .. }))
+                    .count(),
+                1,
+                "{output:?}"
+            );
+        }
     }
 
     #[test]

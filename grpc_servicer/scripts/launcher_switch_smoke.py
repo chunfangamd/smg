@@ -223,9 +223,11 @@ def configure_logging_from_args(args):
     "vllm/plugins/__init__.py": '''
 """vLLM's general-plugin loading, as the launcher's parser build runs it:
 once per process, the `vllm.general_plugins` entry points, filtered by
-VLLM_PLUGINS when set. A checkout of this package that is not installed as a
-distribution has no entry point; its plugin is then loaded by import, which
-is what an editable install registers."""
+VLLM_PLUGINS when set. Unset, only this package's plugin loads: another
+package's plugin imports the real vLLM's modules, which this stub does not
+have (AMD Quark's, in vLLM's ROCm image, imports EngineArgs). A checkout of
+this package that is not installed as a distribution has no entry point; its
+plugin is then loaded by import, which is what an editable install registers."""
 import importlib
 import logging
 import os
@@ -237,7 +239,7 @@ plugins_loaded = False
 
 def load_plugins_by_group(group):
     allowed = os.environ.get("VLLM_PLUGINS")
-    allowed_plugins = None if allowed is None else [p for p in allowed.split(",") if p]
+    allowed_plugins = ["smg-servicer"] if allowed is None else [p for p in allowed.split(",") if p]
     discovered = {plugin.name: plugin.load for plugin in entry_points(group=group)}
     if group == "vllm.general_plugins" and "smg-servicer" not in discovered:
         discovered["smg-servicer"] = lambda: importlib.import_module(
@@ -245,8 +247,8 @@ def load_plugins_by_group(group):
         ).register
     plugins = {}
     for name, load in discovered.items():
-        if allowed_plugins is not None and name not in allowed_plugins:
-            logger.info("plugin %%s skipped by VLLM_PLUGINS", name)
+        if name not in allowed_plugins:
+            logger.info("plugin %%s skipped", name)
             continue
         plugins[name] = load()
     return plugins

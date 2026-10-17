@@ -464,6 +464,10 @@ struct RoutingArgs {
     )]
     balance_rel_threshold: f32,
 
+    /// Seconds between the bucket policy's boundary adjustments (at least 1)
+    #[arg(long, default_value_t = 5, help_heading = "Routing Policy")]
+    bucket_adjust_interval_secs: usize,
+
     /// Abandon cache affinity for shortest-queue when the KV-usage spread
     /// (hottest minus coldest backend, 0.0-1.0) exceeds this — catches
     /// long-context KV imbalance that request counts miss. Backend must
@@ -1204,6 +1208,21 @@ struct ServingArgs {
     #[arg(long, default_value_t = 90, help_heading = "Request Handling")]
     idle_connection_timeout_secs: u64,
 
+    /// Most client connections the data listener (--port) holds open at
+    /// once, counted from accept to close (idle keep-alive connections,
+    /// connections inside a TLS handshake and upgraded connections included).
+    /// A connection beyond the bound is closed at once, before any TLS
+    /// handshake and without a response: the client sees its connection end
+    /// (an end of stream, or a reset when it had already sent its request)
+    /// and should retry with backoff; each is counted in
+    /// smg_http_connections_rejected_total. Readiness is unaffected. Probes
+    /// on the data port are subject to the bound like any connection: point
+    /// them at --health-check-port or --admin-port, which it does not cover
+    /// (the admin listener stays reachable while the data plane is
+    /// saturated). 0 = no bound
+    #[arg(long, default_value_t = 0, help_heading = "Request Handling")]
+    max_connections: usize,
+
     /// Origins a browser may call the gateway from (exact origins,
     /// space-separated), or `*` alone for any origin. Without this flag the
     /// gateway makes no cross-origin allowance
@@ -1614,6 +1633,20 @@ struct IntegrationArgs {
     /// Path to server TLS private key (PEM format)
     #[arg(long, help_heading = "TLS/mTLS Security")]
     tls_key_path: Option<String>,
+
+    /// Client certificate (PEM) presented to workers for mTLS; with
+    /// --client-key-path, both or neither
+    #[arg(long, help_heading = "TLS/mTLS Security")]
+    client_cert_path: Option<String>,
+
+    /// Client private key (PEM) for mTLS with workers; with --client-cert-path
+    #[arg(long, help_heading = "TLS/mTLS Security")]
+    client_key_path: Option<String>,
+
+    /// CA certificates (PEM) the workers' TLS certificates are verified
+    /// against; several paths per flag, and the flag repeats
+    #[arg(long, num_args = 0.., help_heading = "TLS/mTLS Security")]
+    ca_cert_paths: Vec<String>,
 
     // ==================== Tracing (OpenTelemetry) ====================
     /// Enable OpenTelemetry tracing
@@ -2445,7 +2478,7 @@ impl CliArgs {
             "bucket" => PolicyConfig::Bucket {
                 balance_abs_threshold: self.routing.balance_abs_threshold,
                 balance_rel_threshold: self.routing.balance_rel_threshold,
-                bucket_adjust_interval_secs: 5,
+                bucket_adjust_interval_secs: self.routing.bucket_adjust_interval_secs,
             },
             "prefix_hash" => PolicyConfig::PrefixHash {
                 prefix_token_count: self.routing.prefix_token_count,
@@ -3079,6 +3112,7 @@ impl CliArgs {
             .stream_body_stall_timeout_secs(self.serving.stream_body_stall_timeout_secs)
             .header_read_timeout_secs(self.serving.header_read_timeout_secs)
             .idle_connection_timeout_secs(self.serving.idle_connection_timeout_secs)
+            .max_connections(self.serving.max_connections)
             .request_timeout_secs(self.serving.request_timeout_secs)
             .sse_keepalive_secs(self.serving.sse_keepalive_secs)
             .upstream_pool_idle_timeout_secs(self.serving.upstream_pool_idle_timeout_secs)
@@ -3241,6 +3275,11 @@ impl CliArgs {
                 fanout_concurrency: self.workers.rl_fanout_concurrency,
             })
             .dp_minimum_tokens_scheduler(self.routing.dp_minimum_tokens_scheduler)
+            .maybe_client_cert_and_key(
+                self.integrations.client_cert_path.as_ref(),
+                self.integrations.client_key_path.as_ref(),
+            )
+            .add_ca_certificates(self.integrations.ca_cert_paths.clone())
             .maybe_server_cert_and_key(
                 self.integrations.tls_cert_path.as_ref(),
                 self.integrations.tls_key_path.as_ref(),
@@ -3929,15 +3968,99 @@ mod tests {
         );
     }
 
-    /// Three files for the mesh TLS flags (their content is not read here).
-    fn mesh_tls_files(tag: &str) -> [String; 3] {
-        let dir = std::env::temp_dir().join(format!("smg-mesh-tls-{}-{tag}", std::process::id()));
+    /// Three non-empty files for a set of TLS flags (the worker flags' files are
+    /// read into the config and must not be empty; nothing parses the PEM).
+    fn tls_files(kind: &str, names: [&str; 3], tag: &str) -> [String; 3] {
+        let dir = std::env::temp_dir().join(format!("smg-{kind}-tls-{}-{tag}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        ["ca.pem", "node.pem", "node-key.pem"].map(|name| {
+        names.map(|name| {
             let path = dir.join(name);
             std::fs::write(&path, b"test").unwrap();
             path.to_string_lossy().into_owned()
         })
+    }
+
+    /// Three files for the mesh TLS flags.
+    fn mesh_tls_files(tag: &str) -> [String; 3] {
+        tls_files("mesh", ["ca.pem", "node.pem", "node-key.pem"], tag)
+    }
+
+    /// `--bucket-adjust-interval-secs` reaches the bucket policy, which only
+    /// the Python launcher could set until now; without the flag the interval
+    /// stays at 5 s, zero is refused by the validator, a negative by the parser.
+    #[test]
+    fn bucket_adjust_interval_flag_reaches_the_bucket_policy() {
+        let interval = |args: &[&str]| match cli_args_from(args)
+            .to_router_config(vec![], vec![])
+            .unwrap()
+            .policy
+        {
+            PolicyConfig::Bucket {
+                bucket_adjust_interval_secs,
+                ..
+            } => bucket_adjust_interval_secs,
+            other => panic!("expected the bucket policy, got {other:?}"),
+        };
+        assert_eq!(interval(&["--policy", "bucket"]), 5);
+        assert_eq!(
+            interval(&["--policy", "bucket", "--bucket-adjust-interval-secs", "9"]),
+            9
+        );
+
+        let err = cli_args_from(&["--policy", "bucket", "--bucket-adjust-interval-secs", "0"])
+            .to_router_config(vec![], vec![])
+            .expect_err("a zero interval is refused");
+        assert!(
+            err.to_string().contains("bucket_adjust_interval_secs"),
+            "{err}"
+        );
+        assert!(Cli::try_parse_from(["smg", "--bucket-adjust-interval-secs", "-1"]).is_err());
+    }
+
+    /// Three files for the worker mTLS flags.
+    fn worker_tls_files(tag: &str) -> [String; 3] {
+        tls_files("worker", ["ca.pem", "client.pem", "client-key.pem"], tag)
+    }
+
+    /// The worker mTLS flags reach the config as the launcher's options of the
+    /// same names do: the certificate and key are read into the client
+    /// identity, every CA path into the trust list (several per flag, the
+    /// flag repeats), and a certificate without its key is refused.
+    #[test]
+    fn worker_mtls_flags_reach_the_config() {
+        let [ca, cert, key] = worker_tls_files("all");
+        let [second_ca, _, _] = worker_tls_files("second");
+        let args = cli_args_from(&[
+            "--client-cert-path",
+            &cert,
+            "--client-key-path",
+            &key,
+            "--ca-cert-paths",
+            &ca,
+            &second_ca,
+            "--ca-cert-paths",
+            &ca,
+        ]);
+        assert_eq!(args.integrations.ca_cert_paths, [ca.clone(), second_ca, ca]);
+        let config = args.to_router_config(vec![], vec![]).unwrap();
+        assert!(
+            config.client_identity.is_some(),
+            "certificate and key form the identity"
+        );
+        assert_eq!(config.client_key_path.as_deref(), Some(key.as_str()));
+        assert_eq!(config.ca_certificates.len(), 3);
+
+        let err = cli_args_from(&["--client-cert-path", &cert])
+            .to_router_config(vec![], vec![])
+            .expect_err("a certificate without its key is refused");
+        assert!(err.to_string().contains("--client-key-path"), "{err}");
+
+        let plain = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
+        assert!(
+            plain.client_identity.is_none(),
+            "no flags, no client identity"
+        );
+        assert!(plain.ca_certificates.is_empty(), "no flags, no CA list");
     }
 
     #[test]
@@ -4326,6 +4449,19 @@ mod tests {
         let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
         assert_eq!(defaults.header_read_timeout_secs, 30);
         assert_eq!(defaults.idle_connection_timeout_secs, 90);
+    }
+
+    /// The connection limit is a router setting and must flow into
+    /// `RouterConfig`; without the flag there is no bound.
+    #[test]
+    fn max_connections_flag_flows_into_router_config() {
+        let bounded = cli_args_from(&["--max-connections", "4096"])
+            .to_router_config(vec![], vec![])
+            .unwrap();
+        assert_eq!(bounded.max_connections, 4096);
+
+        let defaults = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(defaults.max_connections, 0);
     }
 
     /// The SSE keep-alive interval is a router-only setting and must flow

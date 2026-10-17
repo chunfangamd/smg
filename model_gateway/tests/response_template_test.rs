@@ -13,12 +13,13 @@ mod scripted_tokenizer;
 mod scripted_worker;
 
 use std::{
+    collections::HashMap,
     sync::{Arc, Mutex},
     time::Duration,
 };
 
 use axum::{body::to_bytes, http::StatusCode, response::Response};
-use llm_tokenizer::{traits::Tokenizer, TokenizerRegistry};
+use llm_tokenizer::{chat_template::ChatTemplateParams, traits::Tokenizer, TokenizerRegistry};
 use openai_protocol::{
     model_card::ModelCard,
     worker::{ConstrainedDecoding, HealthCheckConfig},
@@ -110,6 +111,8 @@ struct Setup {
     labels: Vec<(&'static str, &'static str)>,
     /// The text of the vocabulary's end-of-sequence token.
     eos: &'static str,
+    /// The tokenizer reports the rendered prompt as ending inside the model's thought.
+    think_in_prefill: bool,
 }
 
 impl Default for Setup {
@@ -126,59 +129,117 @@ impl Default for Setup {
             constrained_decoding: None,
             labels: Vec::new(),
             eos: EOS,
+            think_in_prefill: false,
         }
     }
+}
+
+/// One scripted worker of the model: the labels on its registry entry (where its engine starts a
+/// grammar, say) and the finish reasons it scripts, one per generation
+/// (`scripted_worker::ScriptedWorker::finish_reasons`).
+struct Engine {
+    labels: Vec<(&'static str, &'static str)>,
+    finish_reasons: Vec<&'static str>,
 }
 
 struct Gateway {
     router: Box<dyn RouterTrait>,
-    worker: JoinHandle<()>,
-    requests: Arc<Mutex<Vec<ts::GenerateRequest>>>,
+    workers: Vec<JoinHandle<()>>,
+    /// Every request each worker received, one log per worker in the order they were served.
+    requests: Vec<Arc<Mutex<Vec<ts::GenerateRequest>>>>,
 }
 
 impl Drop for Gateway {
     fn drop(&mut self) {
-        self.worker.abort();
+        for worker in &self.workers {
+            worker.abort();
+        }
     }
 }
 
 impl Gateway {
-    /// The constraint of the last request the worker received, as `(kind, value)`.
+    /// The constraint of the last request the first worker received, as `(kind, value)`.
     #[expect(clippy::unwrap_used, reason = "test helper")]
     fn last_constraint(&self) -> Option<(String, String)> {
-        let requests = self.requests.lock().unwrap();
-        let params = requests.last()?.sampling_params.as_ref()?;
-        params.constraint.as_ref().map(|constraint| {
-            use ts::sampling_params::Constraint;
-            match constraint {
-                Constraint::StructuralTag(tag) => ("structural_tag".to_string(), tag.clone()),
-                Constraint::JsonSchema(schema) => ("json_schema".to_string(), schema.clone()),
-                Constraint::Regex(regex) => ("regex".to_string(), regex.clone()),
-                Constraint::EbnfGrammar(grammar) => ("ebnf".to_string(), grammar.clone()),
-            }
-        })
+        let requests = self.requests[0].lock().unwrap();
+        constraint_of(requests.last()?)
     }
 }
 
+/// The prompt the Qwen3.5-9B chat template renders for the request [`chat_request`] builds from
+/// `extra`, its messages with its `chat_template_kwargs`: where the template leaves the model. A
+/// precondition of a case, rendered by the fixture's template as the gateway renders it; the
+/// engine's request is not read back (it carries token ids).
+#[expect(clippy::expect_used, reason = "test helper")]
+fn rendered(extra: &Value) -> String {
+    let request = chat_request(extra.clone());
+    let messages: Vec<Value> =
+        serde_json::from_value(serde_json::to_value(&request.messages).expect("the messages"))
+            .expect("the messages as a list");
+    ScriptedTokenizer::from_chunks(Vec::new())
+        .with_chat_template(&qwen3_5_chat_template())
+        .expect("the chat template")
+        .apply_chat_template(
+            &messages,
+            ChatTemplateParams {
+                add_generation_prompt: true,
+                template_kwargs: request.chat_template_kwargs.as_ref(),
+                ..Default::default()
+            },
+        )
+        .expect("a rendered prompt")
+}
+
+/// A request's constraint as `(kind, value)`.
+fn constraint_of(request: &ts::GenerateRequest) -> Option<(String, String)> {
+    let params = request.sampling_params.as_ref()?;
+    params.constraint.as_ref().map(|constraint| {
+        use ts::sampling_params::Constraint;
+        match constraint {
+            Constraint::StructuralTag(tag) => ("structural_tag".to_string(), tag.clone()),
+            Constraint::JsonSchema(schema) => ("json_schema".to_string(), schema.clone()),
+            Constraint::Regex(regex) => ("regex".to_string(), regex.clone()),
+            Constraint::EbnfGrammar(grammar) => ("ebnf".to_string(), grammar.clone()),
+        }
+    })
+}
+
+/// The gateway over one worker, with the setup's labels and finish reason.
+async fn serve(mut setup: Setup) -> Gateway {
+    let engine = Engine {
+        labels: std::mem::take(&mut setup.labels),
+        finish_reasons: vec![setup.finish],
+    };
+    serve_engines(setup, vec![engine]).await
+}
+
+/// The gateway over one scripted worker per engine; the setup's own labels and finish reason are
+/// those of [`serve`]'s one worker and are not read here.
 #[expect(
     clippy::unwrap_used,
     clippy::disallowed_methods,
-    reason = "test helper; the scripted worker is aborted when the gateway is dropped"
+    reason = "test helper; the scripted workers are aborted when the gateway is dropped"
 )]
-async fn serve(setup: Setup) -> Gateway {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
+async fn serve_engines(setup: Setup, engines: Vec<Engine>) -> Gateway {
     let chunks = tokens(setup.output);
-    let requests = Arc::new(Mutex::new(Vec::new()));
-    let worker = tokio::spawn(
-        scripted_worker::ScriptedWorker {
-            output_tokens: u32::try_from(chunks.len()).unwrap(),
-            finish_reasons: vec![setup.finish],
-            generation: Default::default(),
-            requests: requests.clone(),
-        }
-        .serve(listener),
-    );
+    let mut workers = Vec::new();
+    let mut logs = Vec::new();
+    let mut ports = Vec::new();
+    for engine in &engines {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        ports.push(listener.local_addr().unwrap().port());
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        workers.push(tokio::spawn(
+            scripted_worker::ScriptedWorker {
+                output_tokens: u32::try_from(chunks.len()).unwrap(),
+                finish_reasons: engine.finish_reasons.clone(),
+                generation: Default::default(),
+                requests: requests.clone(),
+            }
+            .serve(listener),
+        ));
+        logs.push(requests);
+    }
     let mut config = RouterConfig::builder()
         .mode(RoutingMode::Regular {
             worker_urls: vec![],
@@ -206,6 +267,9 @@ async fn serve(setup: Setup) -> Gateway {
     if let Some(template) = setup.template {
         tokenizer = tokenizer.with_response_template(template);
     }
+    if setup.think_in_prefill {
+        tokenizer = tokenizer.with_think_in_prefill();
+    }
     let tokenizer: Arc<dyn Tokenizer> = Arc::new(tokenizer);
     let tokenizers = Arc::new(TokenizerRegistry::new());
     tokenizers
@@ -213,31 +277,32 @@ async fn serve(setup: Setup) -> Gateway {
         .await
         .unwrap();
     let context = common::create_test_context_with_tokenizer_registry(config, tokenizers).await;
-    let mut worker_entry = BasicWorkerBuilder::new(format!("grpc://127.0.0.1:{port}"))
-        .worker_type(WorkerType::Regular)
-        .connection_mode(ConnectionMode::Grpc)
-        .runtime_type(RuntimeType::TokenSpeed)
-        .model(ModelCard::new(MODEL))
-        .health_config(HealthCheckConfig {
-            disable_health_check: true,
-            ..Default::default()
-        });
-    if let Some(policy) = setup.constrained_decoding {
-        worker_entry = worker_entry.constrained_decoding(policy);
+    for (engine, port) in engines.iter().zip(ports) {
+        let mut worker_entry = BasicWorkerBuilder::new(format!("grpc://127.0.0.1:{port}"))
+            .worker_type(WorkerType::Regular)
+            .connection_mode(ConnectionMode::Grpc)
+            .runtime_type(RuntimeType::TokenSpeed)
+            .model(ModelCard::new(MODEL))
+            .health_config(HealthCheckConfig {
+                disable_health_check: true,
+                ..Default::default()
+            });
+        if let Some(policy) = setup.constrained_decoding {
+            worker_entry = worker_entry.constrained_decoding(policy);
+        }
+        for (key, value) in &engine.labels {
+            worker_entry = worker_entry.label(*key, *value);
+        }
+        context
+            .worker_registry
+            .register(Arc::new(worker_entry.build()))
+            .unwrap();
     }
-    for (key, value) in setup.labels {
-        worker_entry = worker_entry.label(key, value);
-    }
-    let worker_entry = worker_entry.build();
-    context
-        .worker_registry
-        .register(Arc::new(worker_entry))
-        .unwrap();
     let router = RouterFactory::create_router(&context).await.unwrap();
     Gateway {
         router,
-        worker,
-        requests,
+        workers,
+        requests: logs,
     }
 }
 
@@ -523,7 +588,11 @@ async fn hf_gives_a_forced_call_and_a_json_answer_the_tables_tags() {
     .await;
     let (kind, _) = gateway.last_constraint().expect("a constraint");
     assert_eq!(kind, "structural_tag");
-    let request = gateway.requests.lock().expect("requests").last().cloned();
+    let request = gateway.requests[0]
+        .lock()
+        .expect("requests")
+        .last()
+        .cloned();
     assert!(request.is_some());
 }
 
@@ -556,8 +625,10 @@ async fn always_constrains_the_calls_a_request_allows_under_auto() {
     chat(&requested, json!({"tools": tools()})).await;
     assert_eq!(requested.last_constraint(), None);
 
-    // On a registry table, a JSON response_format is the engine's own schema constraint; the
-    // auto tag must not displace it (nor a prompt that continues the assistant's message).
+    // On a registry table too. A JSON response_format is the request's own constraint, which
+    // the auto tag never displaces: the answer's constraint is sent instead, the JSON where the
+    // calls' block would be (its shape on this template, whose prompt leaves the thought open:
+    // `a_registry_tables_json_answer_follows_the_thought_the_prompt_leaves_open`).
     let registry = serve(Setup {
         constrained_decoding: Some(ConstrainedDecoding::Always),
         tool_parser: Some("qwen"),
@@ -566,15 +637,174 @@ async fn always_constrains_the_calls_a_request_allows_under_auto() {
     })
     .await;
     chat(&registry, json!({"tools": tools()})).await;
-    let (kind, _) = registry.last_constraint().expect("a constraint under auto");
+    let (kind, tag) = registry.last_constraint().expect("a constraint under auto");
     assert_eq!(kind, "structural_tag");
+    assert_eq!(block_of(&tag), "triggered_tags", "{tag}");
     chat(
         &registry,
         json!({"tools": tools(), "response_format": {"type": "json_object"}}),
     )
     .await;
-    let (kind, _) = registry.last_constraint().expect("the schema constraint");
+    let (kind, tag) = registry.last_constraint().expect("the answer's constraint");
+    assert_eq!(kind, "structural_tag");
+    assert_eq!(block_of(&tag), "json_schema", "{tag}");
+}
+
+/// A registry table's JSON `response_format` under `always` follows the prompt as the table and
+/// the engine read it (`regular::symphony::reasoning_open`), not the thinking switch alone. The
+/// Qwen 3.5 chat template's generation prompt ends in `<think>\n`, so the model writes its thought
+/// first and the answer after its close: the engine receives the table's answer tag, the
+/// thought's free text (closing itself) and then the JSON, where the bare schema from the first
+/// token would force the JSON inside the thought, which the table reads as reasoning, and the
+/// client would get no content. The engine's own schema constraint stays wherever the tag would
+/// be the schema alone: a request with thinking off, whose prompt closes the thought
+/// (`<think>\n\n</think>\n\n`), and an engine that starts the grammar after its reasoning parser
+/// has seen the close; one that runs it from the first token gets the closed thought, then the
+/// schema.
+#[tokio::test]
+async fn a_registry_tables_json_answer_follows_the_thought_the_prompt_leaves_open() {
+    let answer = json!({"tools": tools(), "response_format": {"type": "json_object"}});
+    let registry = |labels: Vec<(&'static str, &'static str)>| Setup {
+        constrained_decoding: Some(ConstrainedDecoding::Always),
+        tool_parser: Some("qwen"),
+        reasoning_parser: None,
+        labels,
+        ..Setup::default()
+    };
+    // The template's default leaves the thought open: the thought's free text, then the JSON,
+    // for an engine that does not say where it starts the grammar.
+    let prompt = rendered(&answer);
+    assert!(prompt.ends_with(THINKING), "{prompt:?}");
+    let gateway = serve(registry(Vec::new())).await;
+    chat(&gateway, answer.clone()).await;
+    let sent = gateway.last_constraint();
+    assert_eq!(shape_of(sent.clone()), "the free text then the block");
+    let (_, tag) = sent.expect("the answer's tag");
+    assert_eq!(block_of(&tag), "json_schema", "{tag}");
+    let tag: Value = serde_json::from_str(&tag).expect("the tag as JSON");
+    let block = &tag["format"]["elements"][1];
+    assert_eq!(block["json_schema"], json!({"type": "object"}), "{tag}");
+    // Thinking off closes the thought in the prompt: the tag would be the schema alone, and the
+    // engine's own constraint is sent, as before.
+    let off = HashMap::from([("enable_thinking".to_string(), json!(false))]);
+    let mut request = answer.clone();
+    request["chat_template_kwargs"] = json!(off);
+    let prompt = rendered(&request);
+    assert!(prompt.ends_with("</think>\n\n"), "{prompt:?}");
+    chat(&gateway, request).await;
+    let (kind, _) = gateway.last_constraint().expect("the schema constraint");
     assert_eq!(kind, "json_schema");
+    // An engine that starts the grammar after its reasoning parser has consumed the thought: the
+    // schema alone, the engine's own constraint; one that runs it from the first token: the
+    // thought closed by its own marker, then the schema.
+    let after = ("constrained_decoding_start", "after_reasoning");
+    let gateway = serve(registry(vec![after])).await;
+    chat(&gateway, answer.clone()).await;
+    let (kind, _) = gateway.last_constraint().expect("the schema constraint");
+    assert_eq!(kind, "json_schema");
+    let first = ("constrained_decoding_start", "first_token");
+    let gateway = serve(registry(vec![first])).await;
+    chat(&gateway, answer).await;
+    let sent = gateway.last_constraint();
+    assert_eq!(shape_of(sent.clone()), "the closed thought then the block");
+    let (_, tag) = sent.expect("the answer's tag");
+    assert_eq!(block_of(&tag), "json_schema", "{tag}");
+}
+
+/// The kind of the block a tag's format writes after what leads it (the free text or the closed
+/// thought of a prompt that leaves the thought open): the calls' `triggered_tags`, or an answer's
+/// `json_schema`.
+#[expect(clippy::expect_used, reason = "test helper")]
+fn block_of(tag: &str) -> String {
+    let tag: Value = serde_json::from_str(tag).expect("a tag");
+    tag["format"]["elements"][1]["type"]
+        .as_str()
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Which engine a tag under `auto`, or an answer's, is shaped for, the prompt leaving the thought
+/// open: the free text before the block for an engine that does not say where it starts the
+/// grammar, the block alone for one that starts it after its reasoning parser's gate, the closed
+/// thought then the block for one that starts it at the first token.
+#[expect(clippy::expect_used, reason = "test helper")]
+fn shape_of(constraint: Option<(String, String)>) -> &'static str {
+    let Some((kind, tag)) = constraint else {
+        return "no constraint";
+    };
+    if kind != "structural_tag" {
+        return "not a tag";
+    }
+    let tag: Value = serde_json::from_str(&tag).expect("a tag");
+    let first = &tag["format"]["elements"][0];
+    if first["type"] == "any_text" {
+        "the free text then the block"
+    } else if first["end"] == "</think>" {
+        "the closed thought then the block"
+    } else {
+        "the block alone"
+    }
+}
+
+/// Two workers of the model under `always`, whose engines start the grammar at different places
+/// (one after its reasoning parser's gate, one that does not say): the `auto` tag reaches each in
+/// the shape its own start takes, on the first attempt and on a retry alike. Each worker refuses
+/// its first `Generate`, so the request crosses to the other worker and back before it is served:
+/// three attempts, every one carrying the tag shaped for the worker it reached. On a registry
+/// table whose block takes the free-text prefix (Qwen 3.5's tagged calls), the prompt leaving
+/// the thought open, so the two shapes differ.
+#[tokio::test]
+async fn a_retry_takes_the_auto_tag_in_the_shape_its_own_workers_start_needs() {
+    let gateway = serve_engines(
+        Setup {
+            chat_template: false,
+            prompt_tail: THINKING,
+            think_in_prefill: true,
+            tool_parser: Some("qwen_coder"),
+            reasoning_parser: None,
+            constrained_decoding: Some(ConstrainedDecoding::Always),
+            ..Setup::default()
+        },
+        vec![
+            Engine {
+                labels: vec![("constrained_decoding_start", "after_reasoning")],
+                finish_reasons: vec!["unavailable", "stop"],
+            },
+            Engine {
+                labels: vec![],
+                finish_reasons: vec!["unavailable", "stop"],
+            },
+        ],
+    )
+    .await;
+    let served = chat(&gateway, json!({"tools": tools()})).await;
+    assert_eq!(served.calls, vec![weather()]);
+    assert_eq!(served.finish, "tool_calls");
+    assert_eq!(served.reasoning.trim(), "plan the call");
+    // What each worker received: the shape of every tag, and the tags themselves for the message.
+    let received = |log: &Arc<Mutex<Vec<ts::GenerateRequest>>>| {
+        let log = log.lock().expect("the worker's log");
+        let shapes: Vec<&'static str> = log
+            .iter()
+            .map(|request| shape_of(constraint_of(request)))
+            .collect();
+        let tags: Vec<Option<(String, String)>> = log.iter().map(constraint_of).collect();
+        (shapes, tags)
+    };
+    let (gated, gated_tags) = received(&gateway.requests[0]);
+    let (unsaid, unsaid_tags) = received(&gateway.requests[1]);
+    assert_eq!(gated.len() + unsaid.len(), 3, "{gated:?} {unsaid:?}");
+    assert!(
+        !gated.is_empty() && gated.iter().all(|shape| *shape == "the block alone"),
+        "after the gate: {gated:?} {gated_tags:?}"
+    );
+    assert!(
+        !unsaid.is_empty()
+            && unsaid
+                .iter()
+                .all(|shape| *shape == "the free text then the block"),
+        "an engine that does not say: {unsaid:?} {unsaid_tags:?}"
+    );
 }
 
 #[tokio::test]

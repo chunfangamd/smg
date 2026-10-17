@@ -47,6 +47,7 @@ use tokio::{signal, spawn};
 use tracing::{debug, error, info, warn, Level};
 use wfaas::LoggingSubscriber;
 
+pub mod connection_limit;
 pub mod connection_timeouts;
 
 use crate::{
@@ -71,7 +72,10 @@ use crate::{
         http::router::{stream_eligible_request_bodies, StreamBodyState},
         RouterTrait,
     },
-    server::connection_timeouts::{ConnectionTimeoutAcceptor, ConnectionTimeouts},
+    server::{
+        connection_limit::ConnectionLimitAcceptor,
+        connection_timeouts::{ConnectionTimeoutAcceptor, ConnectionTimeouts},
+    },
     service_discovery::{start_service_discovery, RuntimeDiscoveryConfig},
     tenant,
     wasm::route::{add_wasm_module, list_wasm_modules, remove_wasm_module},
@@ -1399,6 +1403,9 @@ pub fn build_apps(
 
 /// The middleware every request crosses, matched or not: body limits, the
 /// trace-context echo, access logging, HTTP metrics, request ids and CORS.
+/// The metrics layer wraps the response body, once, with everything the
+/// layers inside hold until the body ends (the request span, an admission
+/// permit, an SSE keep-alive): see `middleware::edge_body`.
 ///
 /// `Router::layer` wraps only what the router holds when it is called, so the
 /// not-found fallback goes in first. Registered after the layers, unknown
@@ -1417,23 +1424,11 @@ where
 {
     app.fallback(sink_handler)
         .method_not_allowed_fallback(method_not_allowed_handler)
-        // Marks every response that came back through the body-limit layer
-        // below, so the envelope pass outside it re-shapes only the limit
-        // layer's own refusal (a 413 minted inside, a handler's or a relayed
-        // upstream's, keeps its body).
-        .layer(axum::middleware::from_fn(
-            middleware::mark_passed_body_limit_middleware,
-        ))
         .layer(axum::extract::DefaultBodyLimit::max(max_payload_size))
-        .layer(tower_http::limit::RequestBodyLimitLayer::new(
-            max_payload_size,
-        ))
-        // The limit layer refuses a declared over-limit length with a plain
-        // text 413: the gateway's envelope and error code go on here, outside
-        // it, the same as the chunked refusal the extractor builds.
-        .layer(axum::middleware::from_fn(
-            middleware::payload_too_large_envelope_middleware,
-        ))
+        // The payload limit on the request body: a declared over-limit
+        // length is refused here, in the gateway's envelope, before any
+        // layer inside runs; a chunked upload is capped on its way in.
+        .layer(middleware::RequestBodyLimitLayer::new(max_payload_size))
         // The Messages envelope once more, outside the body-size limit: a
         // declared over-limit length is refused by the limit layer before any
         // route layer runs, and still leaves in the envelope.
@@ -2254,10 +2249,37 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         idle_connection_timeout_secs = config.router_config.idle_connection_timeout_secs,
         "HTTP connection timeouts (0 = disabled)"
     );
+    // The bound on the connections open at once (see [`connection_limit`]):
+    // a connection beyond it is closed at accept, unanswered. 0 is no bound.
+    let max_connections = config.router_config.max_connections;
+    info!(
+        max_connections,
+        "HTTP connection limit on the data listener (0 = unlimited; the admin and probe listeners \
+         are outside it)"
+    );
+    // The admission limit the bound is compared with is the effective one
+    // (the one resolution of `max_concurrent_requests`, shared with the
+    // admission bucket).
+    let admission_limit = crate::app_context::effective_max_concurrent_requests(
+        config.router_config.max_concurrent_requests,
+    );
+    if let Some(admission_limit) =
+        admission_limit.filter(|limit| max_connections > 0 && max_connections < *limit)
+    {
+        warn!(
+            max_connections,
+            admission_limit,
+            "The connection limit is below the admission limit: clients on HTTP/1, one request \
+             per connection, are refused at the listener (a closed connection, no response) \
+             before admission can queue or answer them"
+        );
+    }
 
     // The admin listener serves the control plane with the data listener's
-    // TLS material and connection timeouts, and drains with it (the shutdown
-    // above closes both handles together).
+    // TLS material and connection timeouts, but outside its connection limit
+    // (`--max-connections`), so the control plane and the probes it serves
+    // stay reachable while the data plane is saturated; it drains with it
+    // (the shutdown above closes both handles together).
     let admin_serving: Serving = match (admin_listener, admin_app) {
         (Some(admin_listener), Some(admin_app)) => {
             let admin_addr = admin_listener.local_addr()?;
@@ -2289,14 +2311,22 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
         Box::pin(
             axum_server::from_tcp_rustls(listener, tls_config)?
-                .map(|acceptor| tls_acceptor(acceptor, connection_timeouts))
+                .map(|acceptor| {
+                    ConnectionLimitAcceptor::new(
+                        tls_acceptor(acceptor, connection_timeouts),
+                        max_connections,
+                    )
+                })
                 .handle(handle)
                 .serve(app),
         )
     } else {
         Box::pin(
             axum_server::from_tcp(listener)?
-                .acceptor(http_acceptor(connection_timeouts))
+                .acceptor(ConnectionLimitAcceptor::new(
+                    http_acceptor(connection_timeouts),
+                    max_connections,
+                ))
                 .handle(handle)
                 .serve(app),
         )
@@ -2880,9 +2910,8 @@ mod tests {
         assert_eq!(json["error"]["type"], "request_too_large", "{json}");
         assert_eq!(json["request_id"], request_id, "{json}");
 
-        // Declared length: refused by the limit layer before the body, and
-        // still the JSON envelope with the same code as the chunked refusal
-        // (the limit layer's own answer is plain text).
+        // Declared length: refused by the limit layer before the body, with
+        // the JSON envelope and the same code as the chunked refusal.
         let response = app
             .oneshot(
                 http::Request::builder()

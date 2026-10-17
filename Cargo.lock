@@ -7891,6 +7891,7 @@ dependencies = [
  "subtle",
  "thiserror 2.0.21",
  "tokio",
+ "tower",
  "tracing",
  "url",
 ]
@@ -7929,6 +7930,7 @@ dependencies = [
  "http-body-util",
  "memchr",
  "metrics",
+ "metrics-exporter-prometheus",
  "multer",
  "once_cell",
  "openai-protocol",
@@ -8154,7 +8156,9 @@ dependencies = [
 name = "smg-symphony"
 version = "0.1.0"
 dependencies = [
+ "criterion",
  "openai-protocol",
+ "rand 0.10.2",
  "regex",
  "serde",
  "serde_json",
@@ -9254,7 +9258,6 @@ dependencies = [
  "futures-core",
  "http",
  "http-body",
- "http-body-util",
  "percent-encoding",
  "pin-project-lite",
  "tokio",

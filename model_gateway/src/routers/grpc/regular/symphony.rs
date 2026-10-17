@@ -41,7 +41,7 @@
 
 pub(crate) mod template;
 
-use std::{borrow::Cow, sync::Arc};
+use std::{borrow::Cow, fmt, sync::Arc};
 
 use axum::http::HeaderMap;
 use llm_tokenizer::{
@@ -56,7 +56,7 @@ use openai_protocol::{
 };
 use serde_json::{json, Value};
 use symphony::{
-    formats::{for_model, table_for, Table},
+    formats::{for_model_shared, table_for, Table},
     grammar::{GrammarStart, Options},
     Declared, Engine, EngineFinish, Event, Events, Format, Grammar, Input, OutputAnswer,
     OutputChoice, Parser as _, TokenSpan, Turn,
@@ -68,6 +68,7 @@ use self::template::Templates;
 use crate::{
     config::{ParserChoice, TEMPLATE_PARSER},
     routers::grpc::{
+        common::stages::helpers::TagForStart,
         spec::scans_for_tool_calls,
         utils::{Names, WorkerDecoding},
     },
@@ -133,13 +134,14 @@ pub(crate) fn named_table(names: &Names) -> Option<Table> {
 /// channel; `passthrough` alone is the choice to leave the thought as written, which no table
 /// does. A tool-call name no table answers to leaves the response to the legacy parsers. What a
 /// request asks of the channels takes a variant of the table ([`assign`]). Preparation and
-/// request building both decide with this one predicate.
+/// request building both decide with this one predicate. The table comes shared, built once
+/// for every request and engine that reads with it; a variant is a copy.
 pub(crate) fn reads(
     parser: ParserChoice,
     names: &Names,
     model: &str,
     templates: &Templates,
-) -> Result<Option<Format>, String> {
+) -> Result<Option<Arc<Format>>, String> {
     if parser != ParserChoice::Symphony {
         return Ok(None);
     }
@@ -149,15 +151,15 @@ pub(crate) fn reads(
     let table = match named_table(names) {
         Some(table) => table,
         None if names.tool.is_none() && !is_passthrough(names.reasoning.as_deref()) => {
-            return Ok(for_model(model))
+            return Ok(for_model_shared(model))
         }
         None => return Ok(None),
     };
     // The registry's table comes with the model's own turn opener; a table named for a model
     // the registry reads with another, or does not know, replays from the table's own.
-    Ok(match for_model(model) {
+    Ok(match for_model_shared(model) {
         Some(format) if table_for(model) == Some(table) => Some(format),
-        _ => Some(table.format()),
+        _ => Some(table.shared()),
     })
 }
 
@@ -351,6 +353,23 @@ fn answer_tag(
     tagged(grammar, compiled, model, "a JSON answer", continues)
 }
 
+/// Whether the rendered `prompt` leaves the model inside its thought as the table reads it: the
+/// table's replay of the prompt ([`Format::reasoning_open`]), which starts a turn the prompt leaves
+/// unopened inside the thought where the template writes no opener (DeepSeek's after a system
+/// message rendered in place). The grammar built for the request takes it OR'd with the request's
+/// thinking switch, so the tag and the engine read the prompt the same way: a JSON answer the
+/// switch would place at the first token follows the thought's close instead of streaming as
+/// reasoning. `false` when no table reads the response, leaving the switch's answer as it was.
+pub(crate) fn reasoning_open(
+    parser: ParserChoice,
+    names: &Names,
+    model: &str,
+    templates: &Templates,
+    prompt: &str,
+) -> bool {
+    matches!(reads(parser, names, model, templates), Ok(Some(format)) if format.reasoning_open(prompt))
+}
+
 /// Whether the table that reads `model`'s responses under `parser` ([`reads`]) needs the
 /// vocabulary's special tokens kept in the decoded output: one of its markers is, or holds, a
 /// token the stop decoder would drop with `skip_special_tokens` (Muse Spark's `<|message|>` and
@@ -359,16 +378,21 @@ fn answer_tag(
 /// whose tokens decode to its text with the special tokens kept and to something else with them
 /// dropped is such a marker. `false` when no table reads the response, or when every marker
 /// survives the decoder either way (Qwen3's `<think>` and `<tool_call>` are added tokens the
-/// decoder keeps), so a model the older rule already serves is read as before.
+/// decoder keeps), so a model the older rule already serves is read as before. Asking the
+/// tokenizer encodes and decodes every marker, and the answer depends on the tokenizer and the
+/// markers alone, so it is decided once per model and kept with them
+/// ([`Templates::markers_hidden`]).
 pub(crate) fn keeps_special_tokens(
     parser: ParserChoice,
     names: &Names,
     model: &str,
     templates: &Templates,
-    tokenizer: &dyn Tokenizer,
+    tokenizer: &Arc<dyn Tokenizer>,
 ) -> bool {
     match reads(parser, names, model, templates) {
-        Ok(Some(format)) => markers_hidden_by_the_decoder(&format, tokenizer),
+        Ok(Some(format)) => templates.markers_hidden(model, &format, tokenizer, || {
+            markers_hidden_by_the_decoder(&format, tokenizer.as_ref())
+        }),
         _ => false,
     }
 }
@@ -644,6 +668,134 @@ pub(crate) struct WorkerConstraint {
     /// The worker's policy chose the constraint (the whole turn's grammar or the `auto` tag), not
     /// the request: a worker of another policy would not send it.
     pub by_policy: bool,
+    /// The `auto` tag the policy chose, as it derives for a worker's grammar start: the attempt
+    /// stamp gives the worker a retry takes the shape its own start needs ([`AutoTag::for_start`],
+    /// `helpers::ToolConstraintStamp`).
+    pub auto: Option<Arc<AutoTag>>,
+}
+
+/// The table's `auto` tag for a request, derived for where a worker's engine starts the grammar on
+/// a prompt that leaves the thought open: request building shapes it for the worker it selected,
+/// and the attempt stamp for the worker each retry takes, whose start may differ (the retry filter
+/// compares the policy, not the start: [`WorkerDecoding::decides_alike`]). It owns what
+/// [`auto_constraint`] and [`auto_constraint_messages`] read, since the request is gone from the
+/// pipeline once the plan is built. It goes with the plan only when the first worker's start got a
+/// tag: where the table gives that start none, the plan carries no tag and no stamp, and a retry
+/// to a start the table would give one is not covered (no registry table gives one of two starts
+/// a retry may cross between the tag and the other none; the whole turn keeps the first token
+/// apart).
+pub(crate) enum AutoTag {
+    /// A chat request's, over the tools its `tool_choice` leaves callable.
+    Chat {
+        parser: ParserChoice,
+        names: Names,
+        request: Arc<ChatCompletionRequest>,
+        /// The prompt leaves the model inside its thought.
+        reasoning_open: bool,
+        templates: Arc<Templates>,
+    },
+    /// A Messages request's, over `tools` as the template declares them.
+    Messages {
+        parser: ParserChoice,
+        names: Names,
+        request: Arc<CreateMessageRequest>,
+        /// The tools as the template declares them: the spec's own slice, shared, unless
+        /// `tool_choice` narrows it (then the narrowed list, owned here).
+        tools: Arc<[Tool]>,
+        /// The prompt leaves the model inside its thought.
+        reasoning_open: bool,
+        /// The prompt continues the assistant's message.
+        continues: bool,
+        templates: Arc<Templates>,
+    },
+}
+
+impl AutoTag {
+    /// The tag for an engine whose grammar starts at `start`; `None` where the table gives that
+    /// engine none.
+    pub(crate) fn for_start(&self, start: GrammarStart) -> Result<Option<ToolConstraint>, String> {
+        match self {
+            Self::Chat {
+                parser,
+                names,
+                request,
+                reasoning_open,
+                templates,
+            } => auto_constraint(
+                *parser,
+                names,
+                request,
+                &request.callable_tools(),
+                *reasoning_open,
+                start,
+                templates,
+            ),
+            Self::Messages {
+                parser,
+                names,
+                request,
+                tools,
+                reasoning_open,
+                continues,
+                templates,
+            } => auto_constraint_messages(
+                *parser,
+                names,
+                request,
+                tools,
+                *reasoning_open,
+                start,
+                *continues,
+                templates,
+            ),
+        }
+    }
+}
+
+impl TagForStart for AutoTag {
+    fn tag_for(&self, start: WorkerGrammarStart) -> Result<Option<String>, String> {
+        // The table's `auto` tag is a structural tag ([`auto_tag`]); the schema kind is not built
+        // here.
+        Ok(self
+            .for_start(grammar_start_from(start))?
+            .and_then(|constraint| match constraint {
+                ToolConstraint::StructuralTag(tag) => Some(tag),
+                ToolConstraint::JsonSchema(_) => None,
+            }))
+    }
+}
+
+impl fmt::Debug for AutoTag {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Chat {
+                parser,
+                request,
+                reasoning_open,
+                ..
+            } => f
+                .debug_struct("AutoTag::Chat")
+                .field("parser", parser)
+                .field("model", &request.model)
+                .field("reasoning_open", reasoning_open)
+                .finish_non_exhaustive(),
+            Self::Messages {
+                parser,
+                request,
+                tools,
+                reasoning_open,
+                continues,
+                ..
+            } => f
+                .debug_struct("AutoTag::Messages")
+                .field("parser", parser)
+                .field("model", &request.model)
+                .field("tools", &tools.len())
+                .field("reasoning_open", reasoning_open)
+                .field("continues", continues)
+                .finish_non_exhaustive(),
+        }
+    }
 }
 
 /// What constrains a request's output on the worker selected for it, whose engine takes a grammar
@@ -654,16 +806,17 @@ pub(crate) struct WorkerConstraint {
 /// - `always`, on an engine that starts the grammar at the first token: the whole turn's grammar
 ///   (`turn`, [`turn_constraint`]) where it starts; its refusal refuses the request.
 /// - `always` otherwise, or where the whole turn's grammar does not start: what preparation found,
-///   and when that is nothing, the table's tag for the calls `auto` allows (`auto`,
-///   [`auto_constraint`]).
+///   and when that is nothing, the table's tag for the calls `auto` allows (`auto`, the request's
+///   [`AutoTag`], derived for the worker's start).
 ///
 /// When the policy chose the constraint, a retry re-selects only workers that decide alike
-/// ([`WorkerDecoding::decides_alike`]).
+/// ([`WorkerDecoding::decides_alike`]); the `auto` tag goes with the plan as it derives, for the
+/// retry's worker to take in the shape its own start needs.
 pub(crate) fn worker_constraint(
     decoding: WorkerDecoding,
     prepared: PreparedConstraint,
     turn: impl FnOnce() -> Result<Option<ToolConstraint>, String>,
-    auto: impl FnOnce() -> Result<Option<ToolConstraint>, String>,
+    auto: impl FnOnce() -> AutoTag,
 ) -> Result<WorkerConstraint, String> {
     let always = decoding.policy == ConstrainedDecoding::Always;
     if decoding.takes_the_whole_turn() {
@@ -672,21 +825,24 @@ pub(crate) fn worker_constraint(
                 constraint: Some(constraint),
                 whole_turn: true,
                 by_policy: true,
+                auto: None,
             });
         }
     }
-    let (constraint, by_policy) = match prepared? {
+    let (constraint, by_policy, auto) = match prepared? {
         None if always => {
-            let tag = auto()?;
+            let auto = auto();
+            let tag = auto.for_start(grammar_start_from(decoding.start))?;
             let by_policy = tag.is_some();
-            (tag, by_policy)
+            (tag, by_policy, by_policy.then(|| Arc::new(auto)))
         }
-        prepared => (prepared, false),
+        prepared => (prepared, false, None),
     };
     Ok(WorkerConstraint {
         constraint,
         whole_turn: false,
         by_policy,
+        auto,
     })
 }
 
@@ -813,7 +969,8 @@ fn whole_turn(format: &Format, turn: &Turn<'_>) -> Result<Option<ToolConstraint>
 /// ([`assign`]), and the part of the rendered prompt the engine replays.
 #[derive(Clone, Debug)]
 pub(crate) struct Assignment {
-    pub format: Format,
+    /// The table, shared with every reader of the response and every request it reads for.
+    pub format: Arc<Format>,
     pub prompt: String,
 }
 
@@ -821,7 +978,7 @@ pub(crate) struct Assignment {
 /// made when the constraint is a JSON schema: the older path's forced call, whose output has no
 /// markers for a table to read, which the older registry writes where the table has no tag.
 fn assignment(
-    format: Option<Format>,
+    format: Option<Arc<Format>>,
     model: &str,
     constraint: Option<&(String, String)>,
     prompt: &str,
@@ -839,18 +996,20 @@ fn assignment(
 /// tool parser (the request asks for none, or its response is not scanned for calls:
 /// [`scans_for_tool_calls`]), so a table that reads calls from the output's first byte (`json`,
 /// `xlam`) is content from it; without its thought when the request keeps the reasoning in the
-/// content, as the legacy path runs no reasoning parser then.
-fn asked(format: Format, no_calls: bool, no_reasoning: bool) -> Format {
-    let format = if no_calls {
-        format.without_calls()
-    } else {
-        format
-    };
-    if no_reasoning {
-        format.without_reasoning()
-    } else {
-        format
+/// content, as the legacy path runs no reasoning parser then. A variant is a copy of the shared
+/// table; a request that asks for neither reads with the shared table itself.
+fn asked(format: Arc<Format>, no_calls: bool, no_reasoning: bool) -> Arc<Format> {
+    if !no_calls && !no_reasoning {
+        return format;
     }
+    let mut format = Arc::unwrap_or_clone(format);
+    if no_calls {
+        format = format.without_calls();
+    }
+    if no_reasoning {
+        format = format.without_reasoning();
+    }
+    Arc::new(format)
 }
 
 /// Symphony's assignment to a chat `request`, if a table reads the response ([`reads`]) and the
@@ -980,6 +1139,11 @@ pub(crate) struct Reader {
     ended: bool,
     /// Drop the events of every call after the first.
     first_call_only: bool,
+    /// The delta being read: the text the decoder released, each token's span in it, and the
+    /// tokens read; kept between deltas, so a stream fills them once.
+    text: String,
+    spans: Vec<TokenSpan>,
+    tokens: Vec<u32>,
 }
 
 impl Reader {
@@ -987,13 +1151,16 @@ impl Reader {
     /// as its response spec holds them: every choice's reader shares them, none copies a schema.
     pub(crate) fn new(assignment: &Assignment, tools: Arc<[Tool]>) -> Result<Self, String> {
         let mut reader = Self {
-            engine: Engine::new(assignment.format.clone(), Declared::shared(tools)),
+            engine: Engine::shared(Arc::clone(&assignment.format), Declared::shared(tools)),
             events: Events::new(),
             last_token: None,
             ends: Vec::new(),
             read: 0,
             ended: false,
             first_call_only: false,
+            text: String::new(),
+            spans: Vec::new(),
+            tokens: Vec::new(),
         };
         reader.feed(Input::Prompt {
             token_ids: &[],
@@ -1039,43 +1206,47 @@ impl Reader {
         decoder: &mut StopSequenceDecoder,
         token_ids: &[u32],
     ) -> Result<(Vec<Event>, bool), String> {
-        let mut text = String::new();
-        let mut spans = Vec::with_capacity(token_ids.len());
-        let mut read = Vec::with_capacity(token_ids.len());
+        self.text.clear();
+        self.spans.clear();
+        self.tokens.clear();
         let mut stopped = false;
         for &token_id in token_ids {
             let output = decoder
                 .process_token(token_id)
                 .map_err(|e| format!("Stop decoder failed to process token {token_id}: {e}"))?;
-            let start = text.len();
+            let start = self.text.len();
             match output {
-                SequenceDecoderOutput::Text(released) => text.push_str(&released),
+                SequenceDecoderOutput::Text(released) => self.text.push_str(&released),
                 SequenceDecoderOutput::StoppedWithText(released) => {
-                    text.push_str(&released);
+                    self.text.push_str(&released);
                     stopped = true;
                 }
                 SequenceDecoderOutput::Stopped => stopped = true,
                 SequenceDecoderOutput::Held => {}
             }
-            spans.push(TokenSpan {
+            self.spans.push(TokenSpan {
                 token_id,
                 start,
-                end: text.len(),
+                end: self.text.len(),
                 continued: false,
             });
-            self.ends.push(self.read + text.len());
-            read.push(token_id);
+            self.ends.push(self.read + self.text.len());
+            self.tokens.push(token_id);
             self.last_token = Some(token_id);
             if stopped {
                 break;
             }
         }
-        self.read += text.len();
-        self.feed(Input::Delta {
-            token_ids: &read,
-            text: &text,
-            spans: &spans,
-        })?;
+        self.read += self.text.len();
+        feed_engine(
+            &mut self.engine,
+            &mut self.events,
+            Input::Delta {
+                token_ids: &self.tokens,
+                text: &self.text,
+                spans: &self.spans,
+            },
+        )?;
         Ok((self.drained(), stopped))
     }
 
@@ -1130,15 +1301,21 @@ impl Reader {
     }
 
     fn feed(&mut self, input: Input<'_>) -> Result<(), String> {
-        self.engine
-            .feed(input, &mut self.events)
-            .map_err(|e| format!("Symphony failed to read the output: {e}"))
+        feed_engine(&mut self.engine, &mut self.events, input)
     }
+}
+
+/// Feeds `input` to `engine`, its events into `events`: the reader's one way in, over the fields
+/// rather than the reader, so a delta read from the reader's own buffers can be fed too.
+fn feed_engine(engine: &mut Engine, events: &mut Events, input: Input<'_>) -> Result<(), String> {
+    engine
+        .feed(input, events)
+        .map_err(|e| format!("Symphony failed to read the output: {e}"))
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use llm_tokenizer::registry::TokenizerRegistry;
     use serde_json::{json, Value};
@@ -1381,6 +1558,48 @@ mod tests {
             grammar_start_from(WorkerGrammarStart::Unknown),
             symphony::GrammarStart::Unknown
         );
+    }
+
+    /// A prompt the template leaves without a turn opener (a system message rendered in place
+    /// after the user turn) starts the model inside its thought on the DeepSeek V4 table, and the
+    /// grammar built for the request reads it as the engine does, whatever the thinking switch
+    /// said: the answer tag of a JSON `response_format` takes the thought first, as it does on a
+    /// prompt that opened the thought. A prompt that opened and closed the thought (thinking off)
+    /// leaves the model in the content, and the legacy choice asks the table nothing.
+    #[test]
+    fn a_turn_the_prompt_leaves_unopened_is_inside_the_thought_for_the_grammar_too() {
+        let model = "deepseek-ai/DeepSeek-V4-Flash";
+        let unopened = concat!(
+            "<\u{ff5c}begin\u{2581}of\u{2581}sentence\u{ff5c}>Be brief.",
+            "<\u{ff5c}User\u{ff5c}>Fix the failing test.# Environment\n - Platform: linux"
+        );
+        let thinking = "<\u{ff5c}User\u{ff5c}>q<\u{ff5c}Assistant\u{ff5c}><think>";
+        let closed = "<\u{ff5c}User\u{ff5c}>q<\u{ff5c}Assistant\u{ff5c}></think>";
+        let open = |parser, prompt| {
+            reasoning_open(parser, &names(None, None), model, &templates(), prompt)
+        };
+        assert!(open(ParserChoice::Symphony, unopened));
+        assert!(open(ParserChoice::Symphony, thinking));
+        assert!(!open(ParserChoice::Symphony, closed));
+        assert!(!open(ParserChoice::Legacy, unopened));
+        // The JSON answer's tag on the unopened prompt is the thinking prompt's, thought first;
+        // with the thought closed the schema alone is the engine's own constraint, and no tag.
+        let request = request(json!({
+            "model": model, "response_format": {"type": "json_object"}
+        }));
+        let answer = |prompt| {
+            super::constraint(
+                ParserChoice::Symphony,
+                &names(None, None),
+                &request,
+                &[],
+                open(ParserChoice::Symphony, prompt),
+                symphony::GrammarStart::Unknown,
+                &templates(),
+            )
+        };
+        assert_eq!(tag_of(answer(unopened)), tag_of(answer(thinking)));
+        assert!(matches!(answer(closed), Ok(None)));
     }
 
     #[test]
@@ -1830,7 +2049,10 @@ mod tests {
         let kept = request(
             json!({"tools": declared, "tool_choice": "required", "separate_reasoning": false}),
         );
-        assert_eq!(assigned(&kept), table(&kept).without_reasoning());
+        assert_eq!(
+            *assigned(&kept),
+            Arc::unwrap_or_clone(table(&kept)).without_reasoning()
+        );
         assert!(constraint(
             ParserChoice::Symphony,
             &Names::default(),
@@ -1840,7 +2062,10 @@ mod tests {
         )
         .is_some());
         let no_calls = request(json!({"tool_choice": "none"}));
-        assert_eq!(assigned(&no_calls), table(&no_calls).without_calls());
+        assert_eq!(
+            *assigned(&no_calls),
+            Arc::unwrap_or_clone(table(&no_calls)).without_calls()
+        );
         assert!(constraint(
             ParserChoice::Symphony,
             &Names::default(),
@@ -1851,8 +2076,10 @@ mod tests {
         .is_none());
         let neither = request(json!({"separate_reasoning": false}));
         assert_eq!(
-            assigned(&neither),
-            table(&neither).without_calls().without_reasoning()
+            *assigned(&neither),
+            Arc::unwrap_or_clone(table(&neither))
+                .without_calls()
+                .without_reasoning()
         );
         let both = request(json!({"tools": declared}));
         assert_eq!(assigned(&both), table(&both));
@@ -1911,7 +2138,10 @@ mod tests {
         let refused = request(json!({
             "model": "MiniMax-M3", "messages": retry_messages(), "tool_choice": "none"
         }));
-        assert_eq!(assigned(&refused), table(&refused).without_calls());
+        assert_eq!(
+            *assigned(&refused),
+            Arc::unwrap_or_clone(table(&refused)).without_calls()
+        );
         let declared_none = request(json!({"tools": []}));
         assert!(scans_for_tool_calls(&declared_none));
         assert_eq!(
@@ -1922,8 +2152,8 @@ mod tests {
         let undeclared = request(json!({"messages": retry_messages()}));
         assert!(!scans_for_tool_calls(&undeclared));
         assert_eq!(
-            assigned(&undeclared),
-            table(&undeclared).without_calls(),
+            *assigned(&undeclared),
+            Arc::unwrap_or_clone(table(&undeclared)).without_calls(),
             "a provider that reads calls only with tools"
         );
         // A Messages request: declared tools, an empty list included, keep the calls; none
@@ -2355,27 +2585,167 @@ mod tests {
         ));
         // Through the names: Qwen3's table over this vocabulary needs nothing, and no table
         // (the legacy parsers, or `--parser legacy`) asks for nothing.
+        let shared: Arc<dyn Tokenizer> = Arc::new(marker_tokenizer());
         assert!(!keeps_special_tokens(
             ParserChoice::Symphony,
             &names(Some("qwen3"), None),
             "Qwen/Qwen3-8B",
             &templates(),
-            &tokenizer,
+            &shared,
         ));
         assert!(!keeps_special_tokens(
             ParserChoice::Symphony,
             &names(Some("passthrough"), None),
             "Qwen/Qwen3-8B",
             &templates(),
-            &tokenizer,
+            &shared,
         ));
         assert!(!keeps_special_tokens(
             ParserChoice::Legacy,
             &names(Some("qwen3"), None),
             "Qwen/Qwen3-8B",
             &templates(),
-            &tokenizer,
+            &shared,
         ));
+    }
+
+    /// The marker tokenizer, counting the encodes asked of it.
+    struct Counting {
+        inner: llm_tokenizer::MockTokenizer,
+        encodes: AtomicUsize,
+    }
+
+    impl Counting {
+        fn shared() -> (Arc<Self>, Arc<dyn Tokenizer>) {
+            let counting = Arc::new(Self {
+                inner: marker_tokenizer(),
+                encodes: AtomicUsize::new(0),
+            });
+            let tokenizer: Arc<dyn Tokenizer> = counting.clone();
+            (counting, tokenizer)
+        }
+
+        fn encodes(&self) -> usize {
+            self.encodes.load(Ordering::Relaxed)
+        }
+    }
+
+    impl llm_tokenizer::traits::Encoder for Counting {
+        fn encode(
+            &self,
+            input: &str,
+            add_special_tokens: bool,
+        ) -> anyhow::Result<llm_tokenizer::traits::Encoding> {
+            self.encodes.fetch_add(1, Ordering::Relaxed);
+            self.inner.encode(input, add_special_tokens)
+        }
+
+        fn encode_batch(
+            &self,
+            inputs: &[&str],
+            add_special_tokens: bool,
+        ) -> anyhow::Result<Vec<llm_tokenizer::traits::Encoding>> {
+            self.inner.encode_batch(inputs, add_special_tokens)
+        }
+    }
+
+    impl llm_tokenizer::traits::Decoder for Counting {
+        fn decode(&self, token_ids: &[u32], skip_special_tokens: bool) -> anyhow::Result<String> {
+            self.inner.decode(token_ids, skip_special_tokens)
+        }
+    }
+
+    impl Tokenizer for Counting {
+        fn vocab_size(&self) -> usize {
+            self.inner.vocab_size()
+        }
+
+        fn get_special_tokens(&self) -> &llm_tokenizer::traits::SpecialTokens {
+            self.inner.get_special_tokens()
+        }
+
+        fn token_to_id(&self, token: &str) -> Option<u32> {
+            self.inner.token_to_id(token)
+        }
+
+        fn id_to_token(&self, id: u32) -> Option<String> {
+            self.inner.id_to_token(id)
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[test]
+    fn a_decided_true_is_answered_as_true_without_asking_again() {
+        let templates = templates();
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(marker_tokenizer());
+        let asked = std::cell::Cell::new(0);
+        let decide = |format: &Format| {
+            templates.markers_hidden("m", format, &tokenizer, || {
+                asked.set(asked.get() + 1);
+                markers_hidden_by_the_decoder(format, tokenizer.as_ref())
+            })
+        };
+        // Markers this vocabulary hides: decided true once, answered true after.
+        let hidden = table_with_markers("<bos>", "<eos>");
+        assert!(decide(&hidden));
+        assert!(decide(&hidden));
+        assert_eq!(asked.get(), 1);
+        // Markers it keeps, for the same model: decided again, false, once.
+        let kept = table_with_markers("<think>", "</think>");
+        assert!(!decide(&kept));
+        assert!(!decide(&kept));
+        assert_eq!(asked.get(), 2);
+    }
+
+    #[test]
+    fn the_decoders_answer_is_decided_once_per_model_tokenizer_and_markers() {
+        let templates = templates();
+        let (counting, tokenizer) = Counting::shared();
+        let qwen3 = names(Some("qwen3"), None);
+        let decide = |names: &Names, tokenizer: &Arc<dyn Tokenizer>| {
+            keeps_special_tokens(
+                ParserChoice::Symphony,
+                names,
+                "Qwen/Qwen3-8B",
+                &templates,
+                tokenizer,
+            )
+        };
+        // The first request asks the tokenizer about every marker of the table; the next ones
+        // for the same model, tokenizer and markers ask nothing.
+        assert!(!decide(&qwen3, &tokenizer));
+        let asked = counting.encodes();
+        assert_eq!(asked, Table::Qwen3.format().terminal_texts().count());
+        assert!(!decide(&qwen3, &tokenizer));
+        assert!(!decide(&qwen3, &tokenizer));
+        assert_eq!(counting.encodes(), asked);
+        // A table with the same markers is decided: the tagged syntax over the same table, and
+        // GLM's table, whose markers are Qwen3's (its tags are the call syntax's).
+        assert!(!decide(&names(Some("qwen3_tagged"), None), &tokenizer));
+        assert!(!decide(&names(Some("glm"), None), &tokenizer));
+        assert_eq!(counting.encodes(), asked);
+        // The same model and markers under a replaced tokenizer are asked about again: the
+        // entry holds Qwen3's markers still, so the tokenizer alone decides that.
+        let (replaced, other) = Counting::shared();
+        assert!(!decide(&qwen3, &other));
+        assert_eq!(replaced.encodes(), asked);
+        assert_eq!(counting.encodes(), asked);
+        // A table with other markers is asked about again, on the tokenizer in place.
+        assert!(!decide(&names(Some("mistral_v13"), None), &other));
+        let mistral = Table::MistralV13.format().terminal_texts().count();
+        assert_eq!(replaced.encodes(), asked + mistral);
+        // Another model asks for itself.
+        assert!(!keeps_special_tokens(
+            ParserChoice::Symphony,
+            &qwen3,
+            "Qwen/Qwen3-4B",
+            &templates,
+            &other,
+        ));
+        assert_eq!(replaced.encodes(), 2 * asked + mistral);
     }
 
     #[test]
@@ -2392,7 +2762,7 @@ mod tests {
     #[test]
     fn a_reader_ends_once() {
         let assignment = Assignment {
-            format: qwen3(CallSyntax::Json),
+            format: Arc::new(qwen3(CallSyntax::Json)),
             prompt: String::new(),
         };
         let mut reader = Reader::new(&assignment, Arc::default()).expect("a reader");
@@ -2453,10 +2823,8 @@ mod tests {
             .expect("read")
             .expect("assigned");
         assert_eq!(
-            assigned.format,
-            read(&hf, &kept)
-                .expect("read")
-                .expect("a table")
+            *assigned.format,
+            Arc::unwrap_or_clone(read(&hf, &kept).expect("read").expect("a table"))
                 .without_calls()
                 .without_reasoning()
         );
@@ -2697,7 +3065,7 @@ mod tests {
 
     fn read_with(format: Format) -> Vec<Event> {
         let assignment = Assignment {
-            format,
+            format: Arc::new(format),
             prompt: "<|im_start|>assistant\n".to_string(),
         };
         let mut reader = Reader::new(&assignment, tools().into()).expect("a reader");
@@ -2713,7 +3081,7 @@ mod tests {
         const TWO_CALLS: &str = "<tool_call>\n{\"name\": \"lookup\", \"arguments\": {\"q\": 1}}\n</tool_call>\
                                  <tool_call>\n{\"name\": \"lookup\", \"arguments\": {\"q\": 2}}\n</tool_call>";
         let assignment = Assignment {
-            format: qwen3(CallSyntax::Json),
+            format: Arc::new(qwen3(CallSyntax::Json)),
             prompt: "<|im_start|>assistant\n".to_string(),
         };
         let calls = |first_only: bool| {
@@ -2748,7 +3116,7 @@ mod tests {
     #[test]
     fn a_bare_answer_the_json_table_reads_as_a_call_comes_back_as_its_text() {
         let assignment = Assignment {
-            format: symphony::formats::json().without_calls(),
+            format: Arc::new(symphony::formats::json().without_calls()),
             prompt: String::new(),
         };
         let mut reader = Reader::new(&assignment, Arc::default()).expect("a reader");
@@ -2832,8 +3200,19 @@ mod tests {
 
         let tag = |text: &str| ToolConstraint::StructuralTag(text.to_string());
         let refused = |why: &str| Err::<Option<ToolConstraint>, String>(why.to_string());
-        // What one decision gives (the tag's text, and whether it is the whole turn's), and which
-        // of the whole turn's grammar and the `auto` tag it built.
+        // The request's `auto` tag: DeepSeek V4's table over one tool, the thought left open, so
+        // the tag takes a shape for each start.
+        let templates = Arc::new(templates());
+        let auto_tag = || AutoTag::Chat {
+            parser: ParserChoice::Symphony,
+            names: names(Some("deepseek_v4"), Some("deepseek_v4")),
+            request: Arc::new(request(json!({"tools": tools()}))),
+            reasoning_open: true,
+            templates: Arc::clone(&templates),
+        };
+        // What one decision gives (the tag's text, whether it is the whole turn's, whether the
+        // policy chose it, and whether the `auto` tag goes with the plan), and which of the whole
+        // turn's grammar and the `auto` tag it built.
         let decide = |policy, start, prepared: PreparedConstraint, turn: PreparedConstraint| {
             let built = std::cell::RefCell::new(Vec::new());
             let decided = worker_constraint(
@@ -2845,17 +3224,32 @@ mod tests {
                 },
                 || {
                     built.borrow_mut().push("auto");
-                    Ok(Some(tag("auto")))
+                    auto_tag()
                 },
             )
             .map(|decided| {
                 let text = decided.constraint.map(|constraint| constraint.to_tuple().1);
-                (text, decided.whole_turn, decided.by_policy)
+                (
+                    text,
+                    decided.whole_turn,
+                    decided.by_policy,
+                    decided.auto.is_some(),
+                )
             });
             (decided, built.into_inner())
         };
-        // The `auto` tag is the policy's choice; what preparation found is the request's.
-        let found = |text: &str| Ok((Some(text.to_string()), false, text == "auto"));
+        // What preparation found is the request's choice.
+        let found = |text: &str| Ok((Some(text.to_string()), false, false, false));
+        // The `auto` tag is the policy's, in the shape the worker's start takes, and goes with the
+        // plan for a retry's worker.
+        let auto = |start| {
+            let text = auto_tag()
+                .for_start(grammar_start_from(start))
+                .expect("a table")
+                .map(|constraint| constraint.to_tuple().1);
+            assert!(text.is_some(), "{start:?}");
+            Ok((text, false, true, true))
+        };
 
         // `requested`: what preparation found, its refusal included; nothing else is built.
         for start in [FirstToken, AfterReasoning, Unknown] {
@@ -2874,14 +3268,17 @@ mod tests {
             );
             assert_eq!(
                 decide(Requested, start, Ok(None), Ok(Some(tag("turn")))),
-                (Ok((None, false, false)), vec![])
+                (Ok((None, false, false, false)), vec![])
             );
         }
         // `always` from the first token: the whole turn's grammar stands over what preparation
         // found or refused, and its refusal refuses the request.
         assert_eq!(
             decide(Always, FirstToken, refused("no tag"), Ok(Some(tag("turn")))),
-            (Ok((Some("turn".to_string()), true, true)), vec!["turn"])
+            (
+                Ok((Some("turn".to_string()), true, true, false)),
+                vec!["turn"]
+            )
         );
         assert_eq!(
             decide(Always, FirstToken, Ok(None), refused("cannot hold")),
@@ -2899,7 +3296,7 @@ mod tests {
         );
         assert_eq!(
             decide(Always, FirstToken, Ok(None), Ok(None)),
-            (found("auto"), vec!["turn", "auto"])
+            (auto(FirstToken), vec!["turn", "auto"])
         );
         for start in [AfterReasoning, Unknown] {
             assert_eq!(
@@ -2917,10 +3314,10 @@ mod tests {
             );
             assert_eq!(
                 decide(Always, start, Ok(None), Ok(Some(tag("turn")))),
-                (found("auto"), vec!["auto"])
+                (auto(start), vec!["auto"])
             );
         }
-        // Where the table gives no `auto` tag, the policy chose nothing.
+        // Where the table gives no `auto` tag (no tool to call), the policy chose nothing.
         let nothing = worker_constraint(
             WorkerDecoding {
                 policy: Always,
@@ -2928,10 +3325,112 @@ mod tests {
             },
             Ok(None),
             || Ok(None),
-            || Ok(None),
+            || AutoTag::Chat {
+                parser: ParserChoice::Symphony,
+                names: names(Some("deepseek_v4"), Some("deepseek_v4")),
+                request: Arc::new(request(json!({}))),
+                reasoning_open: true,
+                templates: Arc::clone(&templates),
+            },
         )
         .unwrap();
-        assert!(nothing.constraint.is_none() && !nothing.by_policy);
+        assert!(nothing.constraint.is_none() && !nothing.by_policy && nothing.auto.is_none());
+        assert_eq!(
+            decide(Requested, Unknown, Ok(None), Ok(None)).0,
+            Ok((None, false, false, false))
+        );
+    }
+
+    /// The request's `auto` tag derives again for where another worker's engine starts the
+    /// grammar, as a retry needs it: the free-text prefix before the calls for an engine that does
+    /// not say, the bare block for one that starts after its reasoning parser's gate, the closed
+    /// thought then the block for one that starts at the first token; each the tag request
+    /// building gives a worker of that start. For a chat and a Messages request alike.
+    #[test]
+    fn the_auto_tag_derives_again_for_the_start_of_the_worker_a_retry_takes() {
+        use WorkerGrammarStart::{AfterReasoning, FirstToken, Unknown};
+        let templates = Arc::new(templates());
+        let names = names(Some("deepseek_v4"), Some("deepseek_v4"));
+        let chat = request(json!({"tools": tools()}));
+        let messages = message_request(json!({
+            "tools": [{"name": "lookup", "input_schema": {"type": "object"}}]
+        }));
+        let tags = [
+            AutoTag::Chat {
+                parser: ParserChoice::Symphony,
+                names: names.clone(),
+                request: Arc::new(chat.clone()),
+                reasoning_open: true,
+                templates: Arc::clone(&templates),
+            },
+            AutoTag::Messages {
+                parser: ParserChoice::Symphony,
+                names: names.clone(),
+                request: Arc::new(messages.clone()),
+                tools: tools().into(),
+                reasoning_open: true,
+                continues: false,
+                templates: Arc::clone(&templates),
+            },
+        ];
+        for auto_tag in &tags {
+            let built = |start| {
+                let constraint = match auto_tag {
+                    AutoTag::Chat { .. } => auto_constraint(
+                        ParserChoice::Symphony,
+                        &names,
+                        &chat,
+                        &chat.callable_tools(),
+                        true,
+                        start,
+                        &templates,
+                    ),
+                    AutoTag::Messages { .. } => auto_constraint_messages(
+                        ParserChoice::Symphony,
+                        &names,
+                        &messages,
+                        &tools(),
+                        true,
+                        start,
+                        false,
+                        &templates,
+                    ),
+                };
+                tag_of(constraint)
+            };
+            let derived = |start| {
+                let tag = TagForStart::tag_for(auto_tag, start)
+                    .expect("a table")
+                    .expect("a tag");
+                serde_json::from_str::<Value>(&tag).expect("a tag as JSON")
+            };
+            let unknown = derived(Unknown);
+            assert_eq!(
+                unknown,
+                built(symphony::GrammarStart::Unknown),
+                "{auto_tag:?}"
+            );
+            assert_eq!(unknown["format"]["elements"][0]["type"], "any_text");
+            let bare = derived(AfterReasoning);
+            assert_eq!(bare, built(symphony::GrammarStart::AfterReasoning));
+            assert_ne!(bare["format"]["elements"][0]["type"], "any_text", "{bare}");
+            let first = derived(FirstToken);
+            assert_eq!(first, built(symphony::GrammarStart::FirstToken));
+            assert_eq!(first["format"]["elements"][0]["end"], "</think>", "{first}");
+            assert_eq!(first["format"]["elements"][1], bare["format"]);
+        }
+        // A tag the table gives no engine (no tool to call) derives as none for every start.
+        let none = AutoTag::Chat {
+            parser: ParserChoice::Symphony,
+            names,
+            request: Arc::new(request(json!({}))),
+            reasoning_open: true,
+            templates,
+        };
+        for start in [Unknown, AfterReasoning, FirstToken] {
+            assert_eq!(TagForStart::tag_for(&none, start), Ok(None));
+        }
+        assert!(format!("{none:?}").contains("Qwen/Qwen3-8B"));
     }
 
     /// A table whose calls spell a whole turn: a call's header names the tool, its parameters

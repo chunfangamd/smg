@@ -30,7 +30,7 @@ use crate::{
         error,
         grpc::{
             context::{
-                DispatchContext, EncodeWorkerAssignment, RequestContext, RequestType,
+                stage_output, DispatchContext, EncodeWorkerAssignment, RequestContext, RequestType,
                 RoutingSnapshot, WireConstraint, WorkerSelection,
             },
             multimodal,
@@ -305,16 +305,10 @@ impl WorkerSelectionStage {
         if let Some(refused) = accepted.and_then(|accepted| self.refuse_if_expired(ctx, accepted)) {
             return Err(refused);
         }
-        let prep = ctx.state.preparation.as_ref().ok_or_else(|| {
-            error!(
-                function = "WorkerSelectionStage::execute",
-                "Preparation stage not completed"
-            );
-            error::internal_error(
-                "preparation_stage_not_completed",
-                "Preparation stage not completed",
-            )
-        })?;
+        let prep = stage_output(
+            ctx.state.preparation.as_ref(),
+            "WorkerSelectionStage::execute",
+        )?;
 
         let intermediate = ctx.state.multimodal_intermediate.as_ref();
         // Media references only go to workers that advertise worker-side processing.
@@ -354,9 +348,14 @@ impl WorkerSelectionStage {
 
         // Selection inputs that survive the request drop: retry attempts
         // re-select from these. Text is copied only when a configured policy
-        // would actually read it (tokens win otherwise).
-        let keep_text =
-            tokens.is_none() || self.policy_registry.any_policy_needs_request_text(headers);
+        // would actually read it: always without token ids, and with them
+        // only for a policy that reads text next to the ids (cache_aware
+        // routes on the ids and would copy the whole rendered prompt for
+        // nothing).
+        let keep_text = tokens.is_none()
+            || self
+                .policy_registry
+                .any_policy_needs_request_text_with_tokens(headers);
         // The typed engine wires (gRPC servicers, direct ZMQ) do not carry the
         // request's cache-partition fields yet, so the engine's prefix cache
         // is unpartitioned on this path and the router must not split
@@ -5273,6 +5272,73 @@ mod tests {
             None => meta,
         });
         ctx
+    }
+
+    /// Under `cache_aware`, which routes on the token ids, a tokenized
+    /// request's snapshot carries the ids alone; a request without ids keeps
+    /// its text, which is all the policy has then.
+    #[tokio::test]
+    async fn the_snapshot_keeps_the_text_only_without_token_ids_under_cache_aware() {
+        let registry = Arc::new(WorkerRegistry::new());
+        registry
+            .register(regular_worker(
+                "grpc://127.0.0.1:8831",
+                "test-model",
+                UNLABELED,
+            ))
+            .unwrap();
+        let stage = WorkerSelectionStage::new(
+            Arc::clone(&registry),
+            Arc::new(PolicyRegistry::new(PolicyConfig::CacheAware {
+                cache_threshold: 0.5,
+                balance_abs_threshold: 32,
+                balance_rel_threshold: 1.1,
+                eviction_interval_secs: 0,
+                max_tree_size: 4096,
+                block_size: 16,
+                balance_token_usage_threshold: 1.0,
+                overload_token_usage_threshold: 1.0,
+                overlap_decay: 0.0,
+                selection_temperature: 0.0,
+                cache_index: Default::default(),
+                cache_ttl_secs: 180,
+                cache_boundaries: Vec::new(),
+                selection_policy: None,
+                selection_accounting_ttl_ms: 0,
+            })),
+            WorkerSelectionMode::Regular,
+            None,
+        );
+
+        let mut ctx = prepared_ctx(Arc::clone(&registry), None);
+        ctx.state.preparation = Some(PreparationOutput::Generate {
+            original_text: Some("Hello".to_string()),
+            token_ids: vec![1, 2, 3],
+        });
+        stage
+            .execute(&mut ctx)
+            .await
+            .expect("a tokenized request selects");
+        let snapshot = ctx.state.routing_snapshot.as_ref().expect("snapshot");
+        assert_eq!(snapshot.token_ids, [1, 2, 3]);
+        assert!(
+            snapshot.routing_text.is_none(),
+            "the ids route; the prompt is not copied: {:?}",
+            snapshot.routing_text
+        );
+
+        let mut ctx = prepared_ctx(Arc::clone(&registry), None);
+        ctx.state.preparation = Some(PreparationOutput::Generate {
+            original_text: Some("Hello".to_string()),
+            token_ids: Vec::new(),
+        });
+        stage
+            .execute(&mut ctx)
+            .await
+            .expect("a text request selects");
+        let snapshot = ctx.state.routing_snapshot.as_ref().expect("snapshot");
+        assert!(snapshot.token_ids.is_empty());
+        assert_eq!(snapshot.routing_text.as_deref(), Some("Hello"));
     }
 
     /// The vision verdict of a worker without the encoder, of one with it,

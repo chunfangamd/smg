@@ -5,7 +5,9 @@
 //! Workload: 64 tenants (worker URLs) sharing a 512-token (2 KiB) system
 //! prompt, each with its own 64-token (256-char) user turn. "hit" replays a
 //! known prompt and routes it to its matched tenant, the steady state of a
-//! warm tree; "miss" appends a never-seen turn each time; "hit_8_threads"
+//! warm tree; "hit_other" routes it to another tenant, the path on which
+//! the insert replay attaches a tenant; "miss" appends a never-seen turn
+//! each time; "hit_8_threads"
 //! runs the hit path on eight threads against one tree and reports wall time
 //! divided by operations.
 #![expect(clippy::expect_used)]
@@ -124,6 +126,28 @@ fn bench_token_tree(c: &mut Criterion) {
         });
     });
 
+    // The request routes to a tenant other than the one it matched: the insert
+    // replay attaches the routed tenant on every path node (confirming each
+    // edge first) instead of taking the skip branch that "hit" measures. Its
+    // own warm tree, so the rows after it see the tree "hit" left.
+    let (other_tree, other_tenants, other_prompts) = warm_token_tree();
+    let next_names: HashMap<&str, &str> = other_tenants
+        .iter()
+        .zip(other_tenants.iter().cycle().skip(1))
+        .map(|(tenant, next)| (tenant.as_str(), next.as_str()))
+        .collect();
+    let mut j = 0usize;
+    group.bench_function("hit_other", |b| {
+        b.iter(|| {
+            let prompt = &other_prompts[j % TENANTS];
+            j += 1;
+            let result = other_tree
+                .match_and_insert_with(prompt, |r| next_names.get(r.tenant.as_ref()).copied());
+            assert!(result.matched_token_count >= SYSTEM_TOKENS);
+            result.matched_token_count
+        });
+    });
+
     let miss_tree = RefCell::new(warm_token_tree().0);
     let mut turn = 1_000_000u64;
     group.bench_function("miss", |b| {
@@ -191,6 +215,43 @@ fn bench_string_tree(c: &mut Criterion) {
             assert!(result.matched_char_count >= SYSTEM_CHARS);
             result.matched_char_count
         });
+    });
+
+    // The request routes to a tenant other than the one it matched: the insert
+    // replay attaches the routed tenant on every path node (confirming each
+    // edge first) instead of taking the skip branch that "hit" measures. The
+    // attachment happens once per tenant per tree, and criterion runs a whole
+    // batch of setups before the first timed call, so each input carries its
+    // own tree, rebuilt every TENANTS setups: every group of TENANTS
+    // consecutive calls replays onto a tree no earlier call has touched. The
+    // routine returns the tree, so its last drop falls outside the timed
+    // region. Its own trees, so the rows after it see the tree "hit" left.
+    let mut other_tree = warm_string_tree().0;
+    let next_names: HashMap<&str, &str> = tenants
+        .iter()
+        .zip(tenants.iter().cycle().skip(1))
+        .map(|(tenant, next)| (tenant.as_str(), next.as_str()))
+        .collect();
+    let mut j = 0u64;
+    group.bench_function("hit_other", |b| {
+        b.iter_batched(
+            || {
+                if j.is_multiple_of(TENANTS as u64) {
+                    other_tree = warm_string_tree().0;
+                }
+                let k = (j % TENANTS as u64) as usize;
+                j += 1;
+                (Arc::clone(&other_tree), k)
+            },
+            |(tree, k)| {
+                let result = tree.match_and_insert_with(&prompts[k], |r| {
+                    next_names.get(r.tenant.as_ref()).copied()
+                });
+                assert!(result.matched_char_count >= SYSTEM_CHARS);
+                (tree, result.matched_char_count)
+            },
+            BatchSize::SmallInput,
+        );
     });
 
     let miss_tree = RefCell::new(warm_string_tree().0);

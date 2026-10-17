@@ -44,12 +44,28 @@ What the engine decides for every format, and what it leaves open:
   arrived, or the bytes as `Malformed { UnterminatedRegion }`. A region whose closing terminal
   comes before a complete call gives what is left as `Malformed` with a reason that says so,
   since `UnterminatedRegion` means the stream ended inside the region; with the tagged syntax
-  the call is closed for the client first, as `tagged::Assembler::close` says.
+  the call is closed for the client first, as `tagged::Assembler::close` says, unless the close
+  fell inside a streamed string. A JSON call whose arguments value the close cut ends with the
+  fragments it sent and a `Malformed` event of no bytes, with the region's reason, before its
+  end: a cut call is never handed over as a whole one without a word (`json::assembler`). A tagged
+  call the end of the stream cut ends the same way whatever stage the cut found, since the object
+  the assembler writes closes only at the call's own end, and so does one whose close cut a streamed
+  string, in every tag-based syntax (`tagged::end_cut_call`): no closing quote and no closing brace
+  are made up for a value the model never finished, and the one event carries the bytes still held,
+  when there are any. Gemma's reader does the same in its own way (`gemma::Assembler::end`): its one
+  event names the value's reason, which the engine does not rename, and the bytes held at the marker
+  are the string's text, not the event's.
 - With the tagged syntax, a value's type comes from the request's tools (`Declared`): a
   declared string streams, every other value is written at its close. A call to a function the
   request did not declare has every value inferred.
-- Call ids are `call_<index>` for now; the id scheme is the maintainer's decision
-  (deterministic or carrying the conversation's history) and changes only this one line.
+- Call ids are `call_` and 24 lowercase hex characters, the shape the gateway's older parsers
+  mint, so a client tells no difference. The engine draws a nonce at random when it is made
+  (`CallIds::fresh`: 96 random bits; not a UUIDv7, whose in-process counter steps consecutive
+  values by one) and the output's call `index` is the nonce `index` steps on: an id repeats in
+  no other request, since a client pairs its tool results with its calls by id across a
+  conversation, and is the same for one output however its stream is cut.
+  `Engine::with_call_ids` names the nonce for a replay that wants the ids reproducible. No table
+  or assembler chooses an id (`ids.rs`).
 - Every text event says how many tokens it carries, counted by the `Ledger` from the deltas'
   spans: a token in the event that carries its first byte, a byte-less span (a held half of a
   character, or a hidden special token) into the run that carries the next byte, and the tokens

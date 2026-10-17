@@ -15,12 +15,13 @@
 //!
 //! Notes on what this module decides, and on what it leaves open: `docs/engine.md`.
 
-use std::collections::VecDeque;
+use std::{collections::VecDeque, sync::Arc};
 
 use crate::{
-    event::{DropReason, Event, Events, FinishReason, MalformedReason, Text},
+    event::{runs, DropReason, Event, Events, FinishReason, MalformedReason, Text},
     format::{CallSyntax, Emits, Format, Replay},
     gemma,
+    ids::CallIds,
     input::{EngineFinish, Input},
     json,
     markers::{Piece, Scanner},
@@ -30,12 +31,6 @@ use crate::{
     tagged::{self, Declared},
     tokens::Ledger,
 };
-
-pub(crate) const BLOCK_WITHOUT_A_COMPLETE_CALL: &str =
-    "a tool-call block that closed without a complete call";
-pub(crate) const TEXT_AFTER_THE_OBJECT: &str =
-    "text between a call's object and its closing marker";
-const TEXT_BETWEEN_CALLS: &str = "text between a block's calls";
 
 /// Why a call region closed: its closing terminal (or the next opener) arrived, or the stream
 /// stopped where the table says a stop closes it; or the stream ended.
@@ -48,7 +43,8 @@ enum Closed {
 /// A [`Format`] running as a [`Parser`]. One per generated choice.
 #[derive(Debug)]
 pub struct Engine {
-    format: Format,
+    /// The table, shared with every engine that runs it.
+    format: Arc<Format>,
     /// The request's tools, which type a tagged call's values.
     declared: Declared,
     scanner: Scanner,
@@ -56,6 +52,8 @@ pub struct Engine {
     /// The call being assembled while the engine is in an arguments state.
     call: Option<Box<dyn CallAssembler>>,
     calls: u32,
+    /// Where the output's call ids count from.
+    ids: CallIds,
     tokens: Ledger,
     reasoning_tokens: u32,
     stage: Stage,
@@ -127,10 +125,7 @@ fn text_event_like(like: &Event, text: &str) -> Event {
     match like {
         Event::Reasoning(_) => Event::Reasoning(text),
         Event::Dropped { why, .. } => Event::Dropped { text, why: *why },
-        Event::Malformed { why, .. } => Event::Malformed {
-            text,
-            why: why.clone(),
-        },
+        Event::Malformed { why, .. } => Event::Malformed { text, why: *why },
         _ => Event::Content(text),
     }
 }
@@ -228,17 +223,18 @@ impl CallAssembler for ShapedCall {
     }
 }
 
-/// The assembler for `syntax`'s next call, at `index`; `framed` says whether a row of the table
-/// enters the arguments state, so markers frame the region; `values` reads a shaped call's values
-/// and `declared` types them.
+/// The assembler for `syntax`'s next call, at `index` with its id from `ids`; `framed` says
+/// whether a row of the table enters the arguments state, so markers frame the region; `values`
+/// reads a shaped call's values and `declared` types them.
 fn assembler(
     syntax: Option<CallSyntax>,
     index: u32,
+    ids: CallIds,
     framed: bool,
     values: Values,
     declared: &Declared,
 ) -> Box<dyn CallAssembler> {
-    let id = format!("call_{index}");
+    let id = ids.id(index);
     match syntax {
         // `None` is unreachable: `Format::validate`, run by `Engine::new`, refuses a table with
         // an arguments state and no call syntax. The arm keeps the match total.
@@ -247,12 +243,12 @@ fn assembler(
             Box::new(tagged::Assembler::new(index, id, placement))
         }
         Some(CallSyntax::Keyed(tags)) => Box::new(tagged::keyed::Assembler::new(index, id, tags)),
-        Some(CallSyntax::Pythonic(_)) => Box::new(pythonic::Assembler::new(index)),
+        Some(CallSyntax::Pythonic(_)) => Box::new(pythonic::Assembler::new(index, ids)),
         // The list between markers (Llama Nemotron) takes text in place of it as malformed; the
         // bare list the output starts in (xLAM) takes it for prose.
-        Some(CallSyntax::JsonList) if framed => Box::new(json::list::Assembler::framed(index)),
-        Some(CallSyntax::JsonList) => Box::new(json::list::Assembler::new(index)),
-        Some(CallSyntax::JsonAlone) => Box::new(json::list::Assembler::object_or_list(index)),
+        Some(CallSyntax::JsonList) if framed => Box::new(json::list::Assembler::framed(index, ids)),
+        Some(CallSyntax::JsonList) => Box::new(json::list::Assembler::new(index, ids)),
+        Some(CallSyntax::JsonAlone) => Box::new(json::list::Assembler::object_or_list(index, ids)),
         Some(CallSyntax::Xml) => Box::new(tagged::xml::Assembler::new(index, id)),
         Some(CallSyntax::Attributed(tags)) => {
             Box::new(tagged::attributed::Assembler::new(index, id, tags))
@@ -285,7 +281,8 @@ enum Stage {
 impl Engine {
     /// An engine at the start of an output, in the format's initial state, with the request's
     /// tools, which type a tagged call's values (`Declared::default()` for a request without
-    /// tools, or a format that types nothing by them).
+    /// tools, or a format that types nothing by them). The output's call ids count from a nonce
+    /// drawn here ([`CallIds::fresh`]), which no other output shares.
     ///
     /// # Panics
     ///
@@ -296,11 +293,33 @@ impl Engine {
     /// a shaped call a stream cannot run, or one a table cannot open through its terminal (see
     /// [`Format::validate`]). Definitions are written in the crate, so that is a programming
     /// error; a shape built at run time is checked before its table is.
+    pub fn new(format: Format, declared: Declared) -> Self {
+        Self::shared(Arc::new(format), declared)
+    }
+
+    /// [`Self::new`] over a table other engines run too, the registry's
+    /// ([`Table::shared`](crate::formats::Table::shared)) or one the caller keeps: the engine
+    /// holds the one copy. The output's call ids count from a nonce drawn here, as in
+    /// [`Self::new`].
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::new`]: a table [`Format::validate`] refuses.
+    pub fn shared(format: Arc<Format>, declared: Declared) -> Self {
+        Self::with_call_ids(format, declared, CallIds::fresh())
+    }
+
+    /// [`Self::shared`], with the output's call ids counting from `ids` in place of a nonce drawn
+    /// now: for a replay that wants them reproducible.
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::new`].
     #[expect(
         clippy::panic,
         reason = "a table the crate wrote that fails its own check is a programming error"
     )]
-    pub fn new(format: Format, declared: Declared) -> Self {
+    pub fn with_call_ids(format: Arc<Format>, declared: Declared, ids: CallIds) -> Self {
         if let Err(why) = format.validate() {
             panic!("{why}");
         }
@@ -312,6 +331,7 @@ impl Engine {
             state: 0,
             call: None,
             calls: 0,
+            ids,
             tokens: Ledger::new(),
             reasoning_tokens: 0,
             stage: Stage::Fresh,
@@ -429,17 +449,30 @@ impl Engine {
     /// Takes one piece where the turn and the table put it: the turn's first piece decides where
     /// the turn starts, then text is the state's and a terminal moves the engine or is text.
     fn place(&mut self, piece: Piece, out: &mut Events) {
+        self.open_turn(&piece, out);
+        match piece {
+            Piece::Text(text) => self.text(&text, out),
+            Piece::Marker(index) => self.terminal(index, out),
+        }
+    }
+
+    /// Takes a delta that is text whole ([`Scanner::reads_as_text`]) where [`Self::place`] would
+    /// take it as one text piece, without the piece: the common delta of a content or reasoning
+    /// stay, and of a call's arguments, is one.
+    fn place_text(&mut self, text: &str, out: &mut Events) {
+        self.open_turn(&Piece::Text(String::new()), out);
+        self.text(text, out);
+    }
+
+    /// The turn's first piece decides where the turn starts, for a table with a start row.
+    fn open_turn(&mut self, piece: &Piece, out: &mut Events) {
         if self.at_turn_start {
-            if let Some(state) = self.format.opening(self.state, &piece) {
+            if let Some(state) = self.format.opening(self.state, piece) {
                 self.at_turn_start = false;
                 if state != self.state {
                     self.enter(state, out);
                 }
             }
-        }
-        match piece {
-            Piece::Text(text) => self.text(&text, out),
-            Piece::Marker(index) => self.terminal(index, out),
         }
     }
 
@@ -466,7 +499,7 @@ impl Engine {
             return None;
         }
         let terminal = self.format.terminal_text(index);
-        let id = format!("call_{}", self.calls);
+        let id = self.ids.id(self.calls);
         let values = self.format.value_reader();
         let call =
             shape::Assembler::new(self.calls, id, shape, values, terminal.chars().next_back());
@@ -577,9 +610,9 @@ impl Engine {
                 let taken = call.feed(text, &self.declared, &mut assembled);
                 self.region.fed += taken;
                 self.push_call_events(assembled, out);
-                self.wrapping(&text[taken..], TEXT_AFTER_THE_OBJECT, out);
+                self.wrapping(&text[taken..], MalformedReason::TextAfterTheArguments, out);
             }
-            Emits::Wrapper => self.wrapping(text, TEXT_BETWEEN_CALLS, out),
+            Emits::Wrapper => self.wrapping(text, MalformedReason::TextBetweenCalls, out),
         }
     }
 
@@ -684,27 +717,17 @@ impl Engine {
     /// between a block's calls. Each run of whitespace is the template's and is dropped, each run
     /// of anything else is malformed with `why`. Classifying run by run keeps the result the same
     /// wherever the chunks were cut.
-    fn wrapping(&mut self, surplus: &str, why: &str, out: &mut Events) {
-        let mut rest = surplus;
-        while let Some(first) = rest.chars().next() {
-            let space = first.is_whitespace();
-            let length = rest
-                .char_indices()
-                .find(|(_, c)| c.is_whitespace() != space)
-                .map_or(rest.len(), |(at, _)| at);
-            let run = self.tokens.text(&rest[..length]);
+    fn wrapping(&mut self, surplus: &str, why: MalformedReason, out: &mut Events) {
+        for (run, space) in runs(surplus) {
+            let run = self.tokens.text(run);
             out.push(if space {
                 Event::Dropped {
                     text: run,
                     why: DropReason::Wrapper,
                 }
             } else {
-                Event::Malformed {
-                    text: run,
-                    why: MalformedReason::Other(why.to_string()),
-                }
+                Event::Malformed { text: run, why }
             });
-            rest = &rest[length..];
         }
     }
 
@@ -834,6 +857,7 @@ impl Engine {
         assembler(
             self.format.call_syntax().copied(),
             self.calls,
+            self.ids,
             framed,
             self.format.value_reader(),
             &self.declared,
@@ -868,7 +892,7 @@ impl Engine {
                         why: MalformedReason::UnterminatedRegion,
                     } => Event::Malformed {
                         text,
-                        why: MalformedReason::Other(BLOCK_WITHOUT_A_COMPLETE_CALL.to_string()),
+                        why: MalformedReason::BlockWithoutACompleteCall,
                     },
                     event => event,
                 });
@@ -1082,6 +1106,14 @@ impl Parser for Engine {
                 }
                 self.stage = Stage::Streaming;
                 self.tokens.note(text, spans);
+                // A delta that is text whole, with no header pending, is taken as the one piece
+                // the scan would make of it, without the scan and the piece.
+                if self.pending.is_none() && self.scanner.reads_as_text(text) {
+                    if !text.is_empty() {
+                        self.place_text(text, out);
+                    }
+                    return Ok(());
+                }
                 let pieces = self.scanner.feed(text);
                 self.run(pieces, false, out);
                 Ok(())
@@ -1133,8 +1165,12 @@ mod tests {
         "<arg_key>days</arg_key><arg_value>3</arg_value>"
     );
 
+    fn ids() -> CallIds {
+        CallIds::from_nonce("0123456789abcdef00000000").expect("24 hex")
+    }
+
     fn run(format: Format, output: &str, finish: EngineFinish) -> Vec<Event> {
-        let mut engine = Engine::new(format, declared());
+        let mut engine = Engine::with_call_ids(Arc::new(format), declared(), ids());
         let mut out = Events::new();
         for input in [
             Input::Delta {
@@ -1151,7 +1187,7 @@ mod tests {
 
     /// The events of `output` after `prompt`, ended by a stop.
     fn run_after(format: Format, prompt: &str, output: &str) -> Vec<Event> {
-        let mut engine = Engine::new(format, declared());
+        let mut engine = Engine::with_call_ids(Arc::new(format), declared(), ids());
         let mut out = Events::new();
         for input in [
             Input::Prompt {
@@ -1292,13 +1328,15 @@ mod tests {
             );
             assert_eq!(bytes(&stopped), output);
         }
+        // Inside a string the stop closes nothing, as the marker would not: the call ends with
+        // the fragments it sent and the word that says they are no whole value.
         assert_eq!(
             calls(&run(
                 glm().closes_at_stop("call"),
                 "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Par",
                 EngineFinish::Stop,
             )),
-            [(r#"{"city": "Par"}"#.to_string(), Some(String::new()))]
+            [(r#"{"city": "Par"#.to_string(), Some(String::new()))]
         );
     }
 
@@ -2199,5 +2237,104 @@ mod tests {
             calls(&cut),
             [(r#"{"city": "Paris""#.to_string(), Some(String::new()))]
         );
+    }
+
+    /// Two calls of Qwen3's syntax in one output.
+    const TWO_CALLS: &str = concat!(
+        "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n</tool_call>\n",
+        "<tool_call>\n{\"name\": \"get_time\", \"arguments\": {\"zone\": \"CET\"}}\n</tool_call>"
+    );
+
+    fn ids_of(events: &[Event]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::ToolCallStart { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn two_turns_are_two_engines_whose_call_ids_never_meet() {
+        // The gateway makes one engine per request, so a conversation's turns never share a
+        // nonce: four calls over two turns are four ids, each of the shape the older parsers mint.
+        let turn = || {
+            let mut engine = Engine::new(qwen3(CallSyntax::Json), declared());
+            let mut out = Events::new();
+            engine
+                .feed(
+                    Input::Delta {
+                        token_ids: &[],
+                        text: TWO_CALLS,
+                        spans: &[],
+                    },
+                    &mut out,
+                )
+                .expect("a delta");
+            engine
+                .feed(
+                    Input::End {
+                        finish: EngineFinish::Stop,
+                    },
+                    &mut out,
+                )
+                .expect("the end");
+            ids_of(&out.drain())
+        };
+        let first = turn();
+        let second = turn();
+        assert_eq!(first.len(), 2, "{first:?}");
+        assert_eq!(second.len(), 2, "{second:?}");
+        let mut all: Vec<&String> = first.iter().chain(&second).collect();
+        all.sort();
+        all.dedup();
+        assert_eq!(all.len(), 4, "{first:?} {second:?}");
+        for id in all {
+            assert!(crate::ids::is_minted(id), "{id}");
+        }
+    }
+
+    #[test]
+    fn one_nonce_gives_an_output_the_same_ids_whole_or_cut_character_by_character() {
+        let replay = |pieces: Vec<&str>| {
+            let mut engine =
+                Engine::with_call_ids(Arc::new(qwen3(CallSyntax::Json)), declared(), ids());
+            let mut out = Events::new();
+            for piece in pieces {
+                engine
+                    .feed(
+                        Input::Delta {
+                            token_ids: &[],
+                            text: piece,
+                            spans: &[],
+                        },
+                        &mut out,
+                    )
+                    .expect("a delta");
+            }
+            engine
+                .feed(
+                    Input::End {
+                        finish: EngineFinish::Stop,
+                    },
+                    &mut out,
+                )
+                .expect("the end");
+            ids_of(&out.drain())
+        };
+        let whole = replay(vec![TWO_CALLS]);
+        assert_eq!(
+            whole,
+            [
+                "call_0123456789abcdef00000000",
+                "call_0123456789abcdef00000001"
+            ]
+        );
+        let characters: Vec<&str> = TWO_CALLS
+            .char_indices()
+            .map(|(at, c)| &TWO_CALLS[at..at + c.len_utf8()])
+            .collect();
+        assert_eq!(replay(characters), whole);
     }
 }

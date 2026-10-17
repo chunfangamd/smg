@@ -50,8 +50,7 @@
 
 use super::params::Params;
 use crate::{
-    engine::TEXT_AFTER_THE_OBJECT,
-    event::{DropReason, Event, Events, MalformedReason, Text},
+    event::{runs, DropReason, Event, Events, MalformedReason, Text},
     json::{self, arguments::Strings},
     shape::{
         Arguments, CallShape, Match, Matcher, NameSource, Schema, Slot, Suffix, ValueParser,
@@ -59,8 +58,6 @@ use crate::{
     },
     tagged::Declared,
 };
-
-const TEXT_AFTER_THE_ARGUMENTS: &str = "text after a call's arguments";
 
 /// What a call's header says, once the bytes fed after the terminal decide it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -157,9 +154,7 @@ impl JsonReader {
 
     /// Why text after the arguments that is not whitespace is malformed: for a value or an object
     /// that ended where its arguments were refused, its invalid arguments, since the text continues
-    /// them; else the reason the JSON syntax gives for text between a call's object and its closing
-    /// marker, for an object that names the call (one that closed after its arguments broke
-    /// included), or for text after the arguments.
+    /// them; else text after the arguments.
     fn surplus(&self) -> MalformedReason {
         let ended_where_refused = match self {
             Self::Json(arguments) => arguments.ended_where_refused(),
@@ -168,13 +163,7 @@ impl JsonReader {
         if ended_where_refused {
             return MalformedReason::InvalidArguments;
         }
-        MalformedReason::Other(
-            match self {
-                Self::Json(_) => TEXT_AFTER_THE_ARGUMENTS,
-                Self::Envelope(_) => TEXT_AFTER_THE_OBJECT,
-            }
-            .to_string(),
-        )
+        MalformedReason::TextAfterTheArguments
     }
 }
 
@@ -480,7 +469,7 @@ impl Value {
             }
         }
         if shape.trailer.0.is_empty() {
-            wrapping(rest, &self.reader.surplus(), out);
+            wrapping(rest, self.reader.surplus(), out);
             return;
         }
         let tail = self.tail.get_or_insert_with(|| {
@@ -531,7 +520,7 @@ impl Value {
                 true
             }
         };
-        wrapping(between, &surplus, out);
+        wrapping(between, surplus, out);
         if enveloped {
             if !trailer.is_empty() {
                 out.push(Event::Dropped {
@@ -551,12 +540,12 @@ impl Value {
         match self.reader {
             JsonReader::Json(mut arguments) => {
                 arguments.finish(out);
-                wrapping(&self.after, &MalformedReason::UnterminatedRegion, out);
+                wrapping(&self.after, MalformedReason::UnterminatedRegion, out);
                 true
             }
             JsonReader::Envelope(assembler) => {
                 assembler.finish(out);
-                wrapping(&self.after, &MalformedReason::UnterminatedRegion, out);
+                wrapping(&self.after, MalformedReason::UnterminatedRegion, out);
                 false
             }
         }
@@ -566,27 +555,17 @@ impl Value {
 /// Bytes after a call's arguments that are no part of the call: each run of whitespace dropped as
 /// wrapping, each run of anything else `Malformed` for `why`. Classifying run by run keeps the
 /// result the same wherever the chunks were cut.
-fn wrapping(text: &str, why: &MalformedReason, out: &mut Events) {
-    let mut rest = text;
-    while let Some(first) = rest.chars().next() {
-        let space = first.is_whitespace();
-        let length = rest
-            .char_indices()
-            .find(|(_, c)| c.is_whitespace() != space)
-            .map_or(rest.len(), |(at, _)| at);
-        let run = Text::uncounted(&rest[..length]);
+fn wrapping(text: &str, why: MalformedReason, out: &mut Events) {
+    for (run, space) in runs(text) {
+        let run = Text::uncounted(run);
         out.push(if space {
             Event::Dropped {
                 text: run,
                 why: DropReason::Wrapper,
             }
         } else {
-            Event::Malformed {
-                text: run,
-                why: why.clone(),
-            }
+            Event::Malformed { text: run, why }
         });
-        rest = &rest[length..];
     }
 }
 
@@ -598,6 +577,7 @@ mod tests {
     use crate::{
         engine::Engine,
         format::{CallSyntax, Emits, Format},
+        ids::CallIds,
         input::{EngineFinish, Input, TokenSpan},
         parser::Parser,
         shape::{
@@ -746,7 +726,8 @@ mod tests {
         let mut plans: Vec<Vec<usize>> = vec![vec![], starts.clone()];
         plans.extend(starts.iter().map(|&cut| vec![cut]));
         let mut runs = plans.iter().map(|cuts| {
-            let mut engine = Engine::new(format.clone(), declared.clone());
+            let mut engine =
+                Engine::with_call_ids(Arc::new(format.clone()), declared.clone(), ids());
             let mut out = Events::new();
             engine
                 .feed(
@@ -804,10 +785,14 @@ mod tests {
         }
     }
 
+    fn ids() -> CallIds {
+        CallIds::from_nonce("0123456789abcdef00000000").expect("24 hex")
+    }
+
     fn start(name: &str, source: &str) -> Event {
         Event::ToolCallStart {
             index: 0,
-            id: "call_0".to_string(),
+            id: ids().id(0),
             name: name.to_string(),
             source: Text::uncounted(source),
         }
@@ -1071,7 +1056,7 @@ mod tests {
                 arguments("{\"a\": 1}"),
                 Event::Malformed {
                     text: Text::uncounted("</c>x"),
-                    why: MalformedReason::Other(TEXT_AFTER_THE_ARGUMENTS.to_string()),
+                    why: MalformedReason::TextAfterTheArguments,
                 },
                 end("</f></c>"),
                 finish(1),
@@ -1103,9 +1088,14 @@ mod tests {
     /// A value the JSON reader refuses is over where it was refused: what follows is the
     /// trailer's to read, so the closing terminal the trailer ends before closes the call, and the
     /// text after it is content. Without this, the refused value took every byte to the stream's
-    /// stop and the close came back as the call's text (#3145's unresolved finding).
+    /// stop and the close came back as the call's text (#3145's unresolved finding). The value
+    /// the trailer cut is no whole one, which a `Malformed` event of no bytes says before the end.
     #[test]
     fn a_refused_value_hands_what_follows_to_the_trailer() {
+        let no_whole_value = || Event::Malformed {
+            text: Text::default(),
+            why: MalformedReason::InvalidArguments,
+        };
         let format = table(named(closing_f()));
         assert_eq!(
             run(&format, "<c><n=f>{\"a\": 1</f>\n</c>Done."),
@@ -1113,6 +1103,7 @@ mod tests {
                 wrapper("<c>"),
                 start("f", "<n=f>"),
                 arguments("{\"a\": 1"),
+                no_whole_value(),
                 end("</f>\n</c>"),
                 content("Done."),
                 finish(1),
@@ -1127,6 +1118,7 @@ mod tests {
             [
                 wrapper("<c>"),
                 start("f", "<n=f>"),
+                no_whole_value(),
                 end("END</c>"),
                 content("Done."),
                 finish(1),
@@ -1141,6 +1133,7 @@ mod tests {
                     text: Text::uncounted(" "),
                     why: DropReason::Whitespace,
                 },
+                no_whole_value(),
                 end("END</c>"),
                 content("Done."),
                 finish(1),
@@ -1180,10 +1173,22 @@ mod tests {
             .position(|event| matches!(event, Event::Content(_)))
             .expect("the text after the call is content");
         assert!(ended < content_at, "{events:#?}");
+        // The arguments the trailer cut are no whole value: said once, before the end.
+        let said: Vec<usize> = events
+            .iter()
+            .enumerate()
+            .filter_map(|(at, event)| match event {
+                Event::Malformed { .. } => Some(at),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(said.len(), 1, "{events:#?}");
+        assert!(said[0] < ended, "{events:#?}");
         assert!(
-            !events
-                .iter()
-                .any(|event| matches!(event, Event::Malformed { .. })),
+            matches!(
+                &events[said[0]],
+                Event::Malformed { text, why: MalformedReason::InvalidArguments } if text.text.is_empty()
+            ),
             "{events:#?}"
         );
         let shown: String = events
@@ -1222,7 +1227,7 @@ mod tests {
                 end(", "),
                 Event::Malformed {
                     text: Text::uncounted("junk"),
-                    why: MalformedReason::Other(TEXT_AFTER_THE_OBJECT.to_string()),
+                    why: MalformedReason::TextAfterTheArguments,
                 },
                 wrapper("</f>\n</c>"),
                 content("Done."),
@@ -1971,9 +1976,7 @@ mod tests {
                 member("{\"n\": 7, \"s\": \"x\"", "<k=n> 7 </k><k=s> x </k>"),
                 Event::Malformed {
                     text: Text::uncounted("<k=n>8</k>"),
-                    why: MalformedReason::Other(
-                        super::super::params::KEY_WRITTEN_TWICE.to_string()
-                    ),
+                    why: MalformedReason::KeyWrittenTwice,
                 },
                 closed(),
                 end("</c>"),
