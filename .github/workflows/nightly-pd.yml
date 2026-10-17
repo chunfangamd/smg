@@ -175,7 +175,7 @@ jobs:
       # container gets the GPUs, the runner's model cache and its HF_TOKEN, but
       # no RDMA devices, so MoRI-IO moves KV over XGMI.
       gpu_vendor: ${{ matrix.vendor || 'nvidia' }}
-      container_image: ${{ matrix.vendor == 'amd' && 'vllm/vllm-openai-rocm:v0.31.0' || '' }}
+      container_image: ${{ matrix.vendor == 'amd' && 'vllm/vllm-openai-rocm:v0.31.0@sha256:749f6f3f944f12af49966ac523c1f8573e4b229594b541954bd5f879b4496b1f' || '' }}
       container_options: ${{ matrix.vendor == 'amd' && (vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN') || '' }}
       vllm_moriio_mode: ${{ matrix.moriio_mode || '' }}
       vllm_moriio_backend: ${{ matrix.kv_backend == 'moriio' && 'xgmi' || '' }}
