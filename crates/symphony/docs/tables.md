@@ -205,11 +205,12 @@ What the table says beyond the others:
 
 - **A call has no closing marker.** `[TOOL_CALLS]` opens the call state, and the state's own rows
   are the next `[TOOL_CALLS]` and the end of the turn: the arguments object's close ends the call
-  (`json::named_arguments`), the next opener or the turn's end ends the region. Text after a closed
-  object and before the next opener is the template's wrapping: whitespace dropped, anything else
-  malformed. The tool's name is the text between the opener and `[ARGS]`, taken as written; the
-  object after `[ARGS]` is the arguments alone, so `ToolCallStart` carries the name and the marker
-  as its source, and the fragments are the object's bytes.
+  (`json::named`, reading the arguments alone), the next opener or the turn's end ends the
+  region. Text after a closed object and before the next opener is the template's wrapping:
+  whitespace dropped, anything else malformed. The tool's name is the text between the opener and
+  `[ARGS]`, taken as written; the object after `[ARGS]` is the arguments alone, so
+  `ToolCallStart` carries the name and the marker as its source, and the fragments are the
+  object's bytes.
 - **The prompt ends at `[/INST]`, or after a tool result.** The template writes no assistant opener
   and no thought in the prompt, whatever the request says: the model writes `[THINK]` itself. After
   a tool result the prompt ends in `[/TOOL_RESULTS]`, and its last `[/INST]` stands before the
@@ -420,3 +421,58 @@ table replays Muse Glimmer 30B's set, whose template writes the same turn of mes
 whether the model ever writes a message to a recipient the table has no row for (its text is
 framing today); and whether `commentary` should reach the client as content or as a channel of its
 own, which the API has no place for.
+
+## Kimi K2 (`kimi_k2`)
+
+What this table says beyond the DeepSeek V3.1 one, whose rows it has (a thought, content, a
+wrapper state for the block, an arguments state per call):
+
+- **One table for the line, and the prompt decides where the output starts.** The six
+  templates (Kimi K2 Instruct, Instruct-0905, K2 Thinking, K2.5, K2.6, K2.7-Code) write the same
+  block of calls; they differ in the thought alone. K2 Instruct writes none; K2 Thinking's
+  generation prompt ends at `<|im_assistant|>assistant<|im_middle|>` and the model writes its
+  own `<think>`; K2.5's and K2.6's end with `<think>`, or with `<think></think>` when the request
+  turns thinking off; K2.7-Code's end with `<think>`, with no switch. The prompt's replay puts
+  the output inside the thought or in content accordingly. Under K2 Instruct a `<think>` the
+  model never writes would be read as a thought, the choice the DeepSeek V3 table made for the
+  same reason: one table serves the deployments that name the line's older parsers. One
+  departure from the older `kimi_thinking` parser, which read everything before `</think>` as
+  the thought whether or not `<think>` came first: K2 Thinking starts in content here, so an
+  output that closes a thought it never opened is content as written, the marker included (the
+  template always writes the opener; the module tests pin the reading).
+- **The id is a call given as data.** `<|tool_call_begin|>` opens a call only where
+  `functions.NAME:N<|tool_call_argument_begin|>` follows it (the shaped header: `functions.`,
+  which the gateway's older `kimik2` parser also reads without, the name, `:`, the index, and
+  the whitespace the vendor's reader allows around the id); the name is read from the id, and
+  the call carries the id as the model wrote it (`Format::call_id(CallId::Header)`: the line's
+  templates render a turn's ids back into the prompt and a tool result names its call by that
+  id, so the gateway numbers no K2 call). An id the header does not match
+  opens no call: the opener and the id are the block's text (`Malformed`, since the block is a
+  wrapper state). The arguments are one JSON value, closed by `<|tool_call_end|>` with nothing
+  between, so a closing marker inside a string argument ends the call there (bellwether #16; the
+  marker is one token the model cannot write as text), and the block's close ends a call still
+  open with what arrived. A second `<|tool_call_begin|>` inside an open call is the call's text:
+  a shaped call's opener may open no call, and the engine cannot hand its text back to a state
+  that holds calls, so the table has no row from `call` into `call`; the templates close every
+  call before the next.
+- **Every marker is one token.** `<|tool_calls_section_begin|>`, `<|tool_call_begin|>`,
+  `<|tool_call_argument_begin|>`, `<|tool_call_end|>` and `<|tool_calls_section_end|>` are each
+  a token of the vocabulary, so a `max_tokens` cut cannot split one; the table declares no
+  structural token.
+- **What the table stands on.** bellwether holds a manifest for each of the six checkpoints and
+  no recorded set yet, so the table stands on the module's tests, which hold a hand-picked set of
+  the turns the templates render for the shapes a tool-calling conversation takes (an answer, a
+  call, two calls, content before a call, a thought and a call, the turn after a tool result, a
+  call with thinking off, arguments that nest and hold text outside ASCII, a brace inside a string
+  value), read whole and at every cut, and on the id contract. Those shapes are hand-written cases
+  of bellwether's sets, which its recorder renders with each template at its pinned revision; the
+  six slugs are listed in the corpus harness (`tests/bellwether_parse_fixtures.rs`), which replays
+  the recorded sets from the fixture pin once it holds them, and the README rows say awaiting
+  fixtures until then. Two things the templates taught: K2
+  Thinking, K2.5 and K2.6 (without `preserve_thinking`) keep the thought of a message that calls
+  and render an answer's as `<think></think>`, so the thought-and-answer turn is rendered where
+  the template keeps it (K2.7-Code, K2.6 with `preserve_thinking`); and the two Instruct
+  templates differ in a block's indentation alone and render the same turns. What the table
+  leaves open: the structural tag for a forced or required call (`Format::grammar` writes none
+  for a shaped call without a layout; the forced table covers `tool_choice` as for the other
+  tables without one), the recorded sets, and the live reading against the engine's own server.

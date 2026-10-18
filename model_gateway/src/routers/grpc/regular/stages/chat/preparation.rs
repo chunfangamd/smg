@@ -400,7 +400,7 @@ pub(crate) async fn prepare_chat_like(
         let symphony_constraint = symphony::constraint(
             parser,
             &names,
-            request,
+            symphony::Asks::Chat(request),
             &constraint_tools,
             reasoning,
             symphony::grammar_start_of(&workers),
@@ -412,7 +412,7 @@ pub(crate) async fn prepare_chat_like(
                 .tool_parser_factory
                 .registry()
                 .generate_tool_constraint(
-                    names.tool.as_deref(),
+                    ctx.components.parser_resolver.legacy_tool(&names),
                     &constraint_tools,
                     tool_choice,
                     reasoning,
