@@ -403,16 +403,16 @@ def _metric_samples(text: str, name: str, **labels: str) -> list[float]:
     return samples
 
 
-def _metric_total(text: str, name: str, **labels: str) -> float:
-    """Sum of a Prometheus metric's samples that carry ``labels``."""
-    return sum(_metric_samples(text, name, **labels))
-
-
-def _engine_metric(workers, name: str, **labels: str) -> float:
-    return sum(
-        _metric_total(httpx.get(f"{w.http_url}/metrics", timeout=5.0).text, name, **labels)
-        for w in workers
-    )
+def _worker_metric(worker, name: str, **labels: str) -> float:
+    """Sum of one vLLM worker's samples of a metric that carry ``labels``, from
+    its /metrics. vLLM exports the series this file reads from start-up, so a
+    worker without one fails the test instead of reading as zero."""
+    response = httpx.get(f"{worker.http_url}/metrics", timeout=5.0)
+    response.raise_for_status()
+    samples = _metric_samples(response.text, name, **labels)
+    where = f" with {labels}" if labels else ""
+    assert samples, f"{worker.base_url} exports no {name} sample{where}"
+    return sum(samples)
 
 
 def _engines_idle(gateway: Gateway) -> tuple[bool, list[dict]]:
@@ -420,8 +420,8 @@ def _engines_idle(gateway: Gateway) -> tuple[bool, list[dict]]:
     states = [
         {
             "worker": w.base_url,
-            "num_running_reqs": _engine_metric([w], "vllm:num_requests_running"),
-            "num_waiting_reqs": _engine_metric([w], "vllm:num_requests_waiting"),
+            "num_running_reqs": _worker_metric(w, "vllm:num_requests_running"),
+            "num_waiting_reqs": _worker_metric(w, "vllm:num_requests_waiting"),
         }
         for w in gateway.prefill_workers + gateway.decode_workers
     ]
@@ -631,17 +631,11 @@ class TestPDTopology:
 
     @staticmethod
     def _decode_computed(gateway: Gateway) -> float:
-        """Prompt tokens the decode workers computed themselves. vLLM exports the
-        series from start-up, so a worker without it fails the test instead of
-        reading as zero."""
-        name = "vllm:prompt_tokens_by_source_total"
-        total = 0.0
-        for worker in gateway.decode_workers:
-            text = httpx.get(f"{worker.http_url}/metrics", timeout=5.0).text
-            samples = _metric_samples(text, name, source="local_compute")
-            assert samples, f'{worker.base_url} exports no {name}{{source="local_compute"}}'
-            total += sum(samples)
-        return total
+        """Prompt tokens the decode workers computed themselves."""
+        return sum(
+            _worker_metric(w, "vllm:prompt_tokens_by_source_total", source="local_compute")
+            for w in gateway.decode_workers
+        )
 
     def test_second_turn_sees_the_first(self, setup_backend):
         _, model, client, gateway = setup_backend
