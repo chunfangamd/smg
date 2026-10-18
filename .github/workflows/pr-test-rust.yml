@@ -909,14 +909,10 @@ jobs:
       always()
       && !cancelled()
       && vars.SMG_RUN_AMD_LEGS == 'true'
-      && needs.detect-changes.outputs.docs-only != 'true'
-      && needs.detect-changes.outputs.symphony-only != 'true'
       && needs.build-wheel.result == 'success'
       && (github.event_name != 'pull_request'
-          || (vars.SMG_RUN_AMD_ON_PRS == 'true'
-              && needs.detect-changes.result == 'success'
-              && (needs.detect-changes.outputs.common == 'true'
-                  || needs.detect-changes.outputs.chat-completions == 'true')))
+          || (vars.SMG_RUN_AMD_ON_PRS == 'true' && needs.detect-changes.result == 'success'))
+      && needs.detect-changes.outputs.skip-chat-completions != 'true'
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: vllm
