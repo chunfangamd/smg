@@ -7,19 +7,21 @@ if [ "$1" = "rocm" ]; then
     pgrep -f 'sglang::|sglang\.launch_server|sglang\.bench|sglang\.data_parallel|sglang\.srt|sgl_diffusion::' | xargs -r kill -9
 
     # `rocm nuke_gpus`: also kill every process holding the GPUs, like nuke_gpus
-    # below. On ROCm every GPU user holds /dev/kfd open.
+    # below. On ROCm every GPU user holds /dev/kfd open. They are found in /proc,
+    # as vLLM's ROCm image has neither lsof nor fuser.
+    kfd_holders() {
+        local fd
+        for fd in /proc/[0-9]*/fd/*; do
+            if [ "$(readlink "$fd" 2>/dev/null)" = /dev/kfd ]; then
+                fd=${fd#/proc/}
+                echo "${fd%%/*}"
+            fi
+        done | sort -u
+    }
     if [ $# -gt 1 ]; then
-        if command -v lsof >/dev/null 2>&1; then
-            lsof -t /dev/kfd 2>/dev/null | xargs -r kill -9 2>/dev/null
-        elif command -v fuser >/dev/null 2>&1; then
-            fuser -k -9 /dev/kfd 2>/dev/null
-        else
-            echo "::warning::neither lsof nor fuser found; GPU processes were not cleaned"
-        fi
+        kfd_holders | xargs -r kill -9 2>/dev/null
         sleep 2
-        if command -v lsof >/dev/null 2>&1; then
-            echo "Processes still holding /dev/kfd: $(lsof -t /dev/kfd 2>/dev/null | wc -l)"
-        fi
+        echo "Processes still holding /dev/kfd: $(kfd_holders | wc -l)"
     fi
 
 else
