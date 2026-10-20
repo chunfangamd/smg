@@ -262,8 +262,11 @@ jobs:
                "run_timeout": "7200",
                "model_cache": "/raid/models", "arm_mode": "concurrent", "max_model_len": "auto"},
               # AMD legs (MI300X, 192 GB per GPU): the H100 legs' models and parsers,
-              # each arm on one GPU (TP=1), both arms concurrent (GPU 0 + GPU 1), in
-              # vLLM's ROCm image of the same CI pin.
+              # both arms concurrent, in vLLM's ROCm image of the same CI pin.
+              # gpt-oss-120b runs each arm on one GPU (TP=1: GPU 0 + GPU 1).
+              # Qwen3.8-27B runs each arm on half the node (TP=4: GPUs 0-3 + 4-7):
+              # at TP=1 its arms had generated 94% of the 17 categories when the
+              # 5-hour cap stopped them (2026-10-19).
               {"name": "gpt-oss-amd", "runner": amd_runner, "vendor": "amd", "tp": 1,
                "image": amd_image, "gpu_a": "0", "gpu_b": "1",
                "model": "openai/gpt-oss-120b", "bfcl_model": "openai/gpt-oss-120b-FC",
@@ -272,8 +275,8 @@ jobs:
                "vllm_extra": "", "gpu_mem": "0.85", "startup_timeout": "900",
                "run_timeout": "7200",
                "model_cache": "/models", "arm_mode": "concurrent", "max_model_len": "auto"},
-              {"name": "qwen3.8-amd", "runner": amd_runner, "vendor": "amd", "tp": 1,
-               "image": amd_image, "gpu_a": "0", "gpu_b": "1",
+              {"name": "qwen3.8-amd", "runner": amd_runner, "vendor": "amd", "tp": 4,
+               "image": amd_image, "gpu_a": "0,1,2,3", "gpu_b": "4,5,6,7",
                "model": "Qwen/Qwen3.8-27B", "bfcl_model": "Qwen/Qwen3.8-27B-FC",
                "vllm_tool": "qwen3_xml", "vllm_reason": "qwen3",
                "smg_tool": "qwen_xml", "smg_reason": "qwen3",
