@@ -266,7 +266,12 @@ jobs:
               # gpt-oss-120b runs each arm on one GPU (TP=1: GPU 0 + GPU 1).
               # Qwen3.8-27B runs each arm on half the node (TP=4: GPUs 0-3 + 4-7):
               # at TP=1 its arms had generated 94% of the 17 categories when the
-              # 5-hour cap stopped them (2026-10-19).
+              # 5-hour cap stopped them (2026-10-19). It also needs AITER's attention:
+              # without it the image picks ROCM_ATTN, whose fallback for this model
+              # (head size 256, 784-token hybrid blocks) slows decode on long
+              # contexts, so multi_turn_long_context alone outlasted the cap even at
+              # TP=4. ROCM_AITER_FA with AITER on is what vLLM's recipe for the same
+              # architecture (Qwen3.6-27B) sets on MI300X.
               {"name": "gpt-oss-amd", "runner": amd_runner, "vendor": "amd", "tp": 1,
                "image": amd_image, "gpu_a": "0", "gpu_b": "1",
                "model": "openai/gpt-oss-120b", "bfcl_model": "openai/gpt-oss-120b-FC",
@@ -280,7 +285,9 @@ jobs:
                "model": "Qwen/Qwen3.8-27B", "bfcl_model": "Qwen/Qwen3.8-27B-FC",
                "vllm_tool": "qwen3_xml", "vllm_reason": "qwen3",
                "smg_tool": "qwen_xml", "smg_reason": "qwen3",
-               "vllm_extra": "", "gpu_mem": "0.85", "startup_timeout": "900",
+               "vllm_extra": "--attention-backend ROCM_AITER_FA",
+               "vllm_env": "VLLM_ROCM_USE_AITER=1",
+               "gpu_mem": "0.85", "startup_timeout": "900",
                "run_timeout": "18000",
                "model_cache": "/models", "arm_mode": "concurrent", "max_model_len": "auto"},
               # DeepSeek-V4.1-Flash with the Blackwell leg's parsers and tokenizer mode,
