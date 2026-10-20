@@ -617,6 +617,23 @@ jobs:
           else
             echo "no $ROOT"
           fi
+      # In a container job (the AMD legs) the runner maps only the start of a
+      # multi-line `path` to the container's runner.temp, so listing the files
+      # one per line uploaded just the first. Gather them under one directory.
+      - name: Stage results for upload
+        if: always()
+        run: |
+          set -uo pipefail
+          OUT="$RUNNER_TEMP/bfcl_artifact"
+          rm -rf "$OUT" && mkdir -p "$OUT"
+          cd "$RUNNER_TEMP"
+          for f in bfcl_ab.md bfcl_ab.json bfcl_transcripts.tgz; do
+            [ -e "$f" ] && cp "$f" "$OUT/"
+          done
+          if [ -d bfcl_ab ]; then
+            find bfcl_ab -path '*/score/*' -type f -exec cp --parents {} "$OUT/" \;
+          fi
+          echo "staged: $(find "$OUT" -type f | wc -l) files, $(du -sh "$OUT" | cut -f1)"
       - name: Upload results (summary + per-case scores + transcripts)
         if: always()
         uses: actions/upload-artifact@v7
@@ -624,11 +641,7 @@ jobs:
           name: bfcl-ab-${{ matrix.name }}-${{ github.run_id }}
           # Summary + per-category score files (which list each failed case for
           # both arms) + a tarball of both arms' raw per-turn transcripts.
-          path: |
-            ${{ runner.temp }}/bfcl_ab.md
-            ${{ runner.temp }}/bfcl_ab.json
-            ${{ runner.temp }}/bfcl_ab/*/score/**
-            ${{ runner.temp }}/bfcl_transcripts.tgz
+          path: ${{ runner.temp }}/bfcl_artifact/
           if-no-files-found: warn
           retention-days: 30
       - name: Upload arm logs (failure only)
